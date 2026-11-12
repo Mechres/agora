@@ -35,6 +35,7 @@ private slots:
     void onRefreshModels();
     void onStartRouterClicked();
     void onOpenSettingsClicked();
+    void onManageProvidersClicked();
     void onStartDebateClicked();
     void onStepTurnClicked();
     void onStopDebateClicked();
@@ -61,6 +62,8 @@ private:
     void refreshParticipantsList();
     void refreshSessionsList();
     bool showParticipantDialog(Participant* inOutParticipant, const QString& dialogTitle);
+    bool showProviderEditDialog(ProviderConfig* inOutProvider, const QString& dialogTitle);
+    QString providerName(const QString& providerId) const;
     void showToolApprovalDialog(quint64 requestId, const QString& speakerHandle, const ToolCall& call);
     void showTurnDiff(int messageIndex);
 
@@ -80,6 +83,7 @@ private:
     QPushButton* m_btnRefreshModels = nullptr;
     QPushButton* m_btnStartRouter = nullptr;
     QPushButton* m_btnSettings = nullptr;
+    QPushButton* m_btnProviders = nullptr;
     QComboBox* m_comboMode = nullptr;
     QSpinBox* m_spinMaxRounds = nullptr;
     QDoubleSpinBox* m_spinVramBudget = nullptr;

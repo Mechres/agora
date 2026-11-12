@@ -2,7 +2,7 @@
 
 **Agora** is a native **C++20 / Qt6** desktop studio where multiple local LLMs debate in a shared room, hand off tasks via `@mentions`, and collaboratively write, patch, review, and execute code inside an isolated **Bubblewrap (`bwrap`)** sandbox workspace.
 
-Built with zero external C++ dependencies beyond the C++20 standard library and system `Qt6` (`Core`, `Gui`, `Widgets`, `Network`, `Sql`, `Test`), Agora is designed for single-GPU local workstations running `llama.cpp`'s `llama-server` in router mode.
+Built with zero external C++ dependencies beyond the C++20 standard library and system `Qt6` (`Core`, `Gui`, `Widgets`, `Network`, `Sql`, `Test`), Agora is designed for single-GPU local workstations running `llama.cpp`'s `llama-server` in router mode. Participants can also run on hosted APIs (OpenAI, Anthropic, Gemini, OpenRouter, ...) alongside local models.
 
 ---
 
@@ -15,6 +15,13 @@ Built with zero external C++ dependencies beyond the C++20 standard library and 
   - **Context Budget**: History is trimmed to fit each model's context window (`n_ctx` from `/props`), calibrated from the real prompt token counts the server reports. The user's task is always kept; on a context-overflow error the turn is retried once with less history.
   - **Ending a Debate**: A participant that writes `[DONE]` closes the session once the task is complete; otherwise the debate runs to the turn limit.
   - **Live Human Intervention**: Stop at any moment, step turn-by-turn, or interject messages mid-debate.
+- **External AI Providers** (top bar → **☁ Providers**):
+  - Any OpenAI-compatible chat API can host participants, mixed freely with local models in the same room. Presets for OpenAI, Anthropic, Google Gemini, OpenRouter, Groq, DeepSeek, Mistral, Ollama and LM Studio.
+  - Pick the provider and model per participant. **Test connection & fetch models** lists the provider's models from `GET /models`.
+  - API keys can be given as `$ENV_VAR` to read them from the environment; a key typed directly is stored in plain text in Agora's settings file.
+  - **Context Budget** (default 32k tokens) caps the history sent per request, which is also the cost cap per turn on paid APIs.
+  - External models skip VRAM management. Agora retries once without `temperature` for models that reject it, and once after 5 s on rate limits or overload (HTTP 429/5xx).
+  - Everything an external participant sees, including file contents and command output from the workspace, is sent to that provider. Tools still run only in the local sandbox, under the same approval policy.
 - **Workspace Checkpoints**:
   - The workspace is snapshotted before and after every turn as commits under `refs/agora/<session>`, using a private index. HEAD, branches and your staging area are never touched, so this is safe inside a real project.
   - Each turn that changed files gets **View changes** (per-turn diff) and **Undo this turn** links in the transcript. Undo saves the current state first, so it can itself be undone.
@@ -51,7 +58,7 @@ Built with zero external C++ dependencies beyond the C++20 standard library and 
 - Optional: a **systemd user session** (`systemd-run --user`) for memory and process limits on sandboxed commands
 - **C++20 compiler** (`GCC 12+` or `Clang 15+`) and **CMake 3.20+**
 - **Qt6** development packages (`Qt6Core`, `Qt6Gui`, `Qt6Widgets`, `Qt6Network`, `Qt6Sql`, `Qt6Test`)
-- **`llama-server`** running in router mode (`--models-dir ~/models --port 8089`)
+- **`llama-server`** running in router mode (`--models-dir ~/models --port 8089`), and/or an API key for an OpenAI-compatible provider
 
 ---
 
@@ -93,6 +100,8 @@ The end-to-end tests run a complete debate against a small fake `llama-server` (
 | Tool Approval | Never ask | See *Tool Approval* above |
 | Max Tool Rounds per Turn | 8 | How many tool-call rounds one participant may chain |
 | Checkpoints | On | Per-turn snapshots, diffs and undo |
+
+External providers are managed separately under **☁ Providers** (name, base URL, API key or `$ENV_VAR`, context budget).
 
 ---
 

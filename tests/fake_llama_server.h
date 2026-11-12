@@ -19,6 +19,11 @@ public:
         int status = 200;
         QByteArray body;
     };
+    struct RequestRecord {
+        QByteArray method;
+        QByteArray path;
+        QByteArray authorization;
+    };
 
     explicit FakeLlamaServer(QString modelId = "fake-model", int contextTokens = 8192)
         : m_modelId(std::move(modelId)), m_contextTokens(contextTokens) {
@@ -35,6 +40,7 @@ public:
 
     void enqueueChat(const ScriptedReply& reply) { m_chatReplies.enqueue(reply); }
     const QVector<QJsonObject>& chatRequests() const { return m_chatRequests; }
+    const QVector<RequestRecord>& requestLog() const { return m_requestLog; }
 
     // SSE body for a reply with optional content, one tool call and final usage/timings
     static QByteArray sse(const QString& content,
@@ -74,9 +80,12 @@ private:
         const QList<QByteArray> lines = buf.left(headerEnd).split('\n');
         const QList<QByteArray> requestLine = lines.value(0).trimmed().split(' ');
         qsizetype contentLength = 0;
+        QByteArray authorization;
         for (const QByteArray& line : lines) {
             if (line.toLower().startsWith("content-length:")) {
                 contentLength = line.mid(15).trimmed().toLongLong();
+            } else if (line.toLower().startsWith("authorization:")) {
+                authorization = line.mid(14).trimmed();
             }
         }
         if (buf.size() < headerEnd + 4 + contentLength) return;
@@ -85,11 +94,13 @@ private:
         const QByteArray path = requestLine.value(1);
         const QByteArray body = buf.mid(headerEnd + 4, contentLength);
         m_buffers.remove(sock);
+        m_requestLog.append({method, path, authorization});
         respond(sock, route(method, path, body));
     }
 
     ScriptedReply route(const QByteArray& method, const QByteArray& path, const QByteArray& body) {
-        if (method == "GET" && path.startsWith("/models")) {
+        // Router-mode /models, or the OpenAI-style /v1/models of a hosted API
+        if (method == "GET" && (path.startsWith("/models") || path.startsWith("/v1/models"))) {
             const QJsonObject model{{"id", m_modelId}, {"status", QJsonObject{{"value", "loaded"}}}};
             return {200, QJsonDocument(QJsonObject{{"data", QJsonArray{model}}}).toJson()};
         }
@@ -125,5 +136,6 @@ private:
     int m_contextTokens;
     QQueue<ScriptedReply> m_chatReplies;
     QVector<QJsonObject> m_chatRequests;
+    QVector<RequestRecord> m_requestLog;
     QHash<QTcpSocket*, QByteArray> m_buffers;
 };

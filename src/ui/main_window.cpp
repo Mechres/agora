@@ -9,6 +9,7 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFormLayout>
+#include <QJsonArray>
 #include <QHBoxLayout>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -176,6 +177,11 @@ void MainWindow::loadAppSettings() {
     m_orchestrator->setAutoCheckpoints(settings.value("orchestrator/autoCheckpoints", true).toBool());
     m_orchestrator->setToolApprovalPolicy(static_cast<ToolApprovalPolicy>(
         settings.value("orchestrator/approvalPolicy", static_cast<int>(ToolApprovalPolicy::Off)).toInt()));
+
+    QVector<ProviderConfig> providers;
+    const QJsonArray provArr = QJsonDocument::fromJson(settings.value("providers/list").toByteArray()).array();
+    for (const auto& v : provArr) providers.append(ProviderConfig::fromJson(v.toObject()));
+    m_orchestrator->setProviders(providers);
 }
 
 void MainWindow::saveAppSettings() {
@@ -190,6 +196,10 @@ void MainWindow::saveAppSettings() {
     settings.setValue("orchestrator/maxToolDepth", m_orchestrator->maxToolDepth());
     settings.setValue("orchestrator/autoCheckpoints", m_orchestrator->autoCheckpoints());
     settings.setValue("orchestrator/approvalPolicy", static_cast<int>(m_orchestrator->toolApprovalPolicy()));
+
+    QJsonArray provArr;
+    for (const auto& prov : m_orchestrator->providers()) provArr.append(prov.toJson());
+    settings.setValue("providers/list", QJsonDocument(provArr).toJson(QJsonDocument::Compact));
 }
 
 void MainWindow::setupUi() {
@@ -208,6 +218,8 @@ void MainWindow::setupUi() {
     m_btnRefreshModels = new QPushButton("Refresh Models", topBar);
     m_btnStartRouter = new QPushButton("Start Router", topBar);
     m_btnSettings = new QPushButton("⚙ Settings", topBar);
+    m_btnProviders = new QPushButton("☁ Providers", topBar);
+    m_btnProviders->setToolTip("External OpenAI-compatible APIs (OpenAI, Anthropic, Gemini, OpenRouter, Ollama, ...)");
 
     m_comboMode = new QComboBox(topBar);
     m_comboMode->addItem("Round-Robin + @mention", static_cast<int>(DebateMode::RoundRobinWithMentions));
@@ -236,6 +248,7 @@ void MainWindow::setupUi() {
     topLayout->addWidget(m_btnRefreshModels);
     topLayout->addWidget(m_btnStartRouter);
     topLayout->addWidget(m_btnSettings);
+    topLayout->addWidget(m_btnProviders);
     topLayout->addStretch();
     topLayout->addWidget(new QLabel("Mode:", topBar));
     topLayout->addWidget(m_comboMode);
@@ -304,6 +317,7 @@ void MainWindow::setupUi() {
     connect(m_btnRefreshModels, &QPushButton::clicked, this, &MainWindow::onRefreshModels);
     connect(m_btnStartRouter, &QPushButton::clicked, this, &MainWindow::onStartRouterClicked);
     connect(m_btnSettings, &QPushButton::clicked, this, &MainWindow::onOpenSettingsClicked);
+    connect(m_btnProviders, &QPushButton::clicked, this, &MainWindow::onManageProvidersClicked);
     connect(m_btnStart, &QPushButton::clicked, this, &MainWindow::onStartDebateClicked);
     connect(m_btnStep, &QPushButton::clicked, this, &MainWindow::onStepTurnClicked);
     connect(m_btnStop, &QPushButton::clicked, this, &MainWindow::onStopDebateClicked);
@@ -486,6 +500,196 @@ void MainWindow::onOpenSettingsClicked() {
     onRefreshModels();
 }
 
+QString MainWindow::providerName(const QString& providerId) const {
+    for (const auto& prov : m_orchestrator->providers()) {
+        if (prov.id == providerId) return prov.name;
+    }
+    return providerId;
+}
+
+void MainWindow::onManageProvidersClicked() {
+    QVector<ProviderConfig> providers = m_orchestrator->providers();
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("External AI Providers");
+    dlg.resize(620, 380);
+    auto* layout = new QVBoxLayout(&dlg);
+
+    auto* intro = new QLabel(
+        "Any OpenAI-compatible chat API can host participants: OpenAI, Anthropic, Google Gemini, "
+        "OpenRouter, Groq, DeepSeek, Mistral, or a local Ollama / LM Studio. "
+        "Choose the provider per participant in its settings.", &dlg);
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    auto* list = new QListWidget(&dlg);
+    layout->addWidget(list, 1);
+    auto refreshList = [list, &providers]() {
+        list->clear();
+        for (const auto& prov : providers) {
+            list->addItem(QStringLiteral("%1 — %2  (%3 models)")
+                              .arg(prov.name, prov.baseUrl, QString::number(prov.models.size())));
+        }
+    };
+    refreshList();
+
+    auto* row = new QHBoxLayout();
+    auto* btnAdd = new QPushButton("Add…", &dlg);
+    auto* btnEdit = new QPushButton("Edit…", &dlg);
+    auto* btnRemove = new QPushButton("Remove", &dlg);
+    row->addWidget(btnAdd);
+    row->addWidget(btnEdit);
+    row->addWidget(btnRemove);
+    row->addStretch();
+    layout->addLayout(row);
+
+    connect(btnAdd, &QPushButton::clicked, &dlg, [this, &providers, refreshList]() {
+        ProviderConfig prov;
+        prov.id = "prov_" + QUuid::createUuid().toString(QUuid::Id128).left(10);
+        if (showProviderEditDialog(&prov, "Add Provider")) {
+            providers.append(prov);
+            refreshList();
+        }
+    });
+    auto editCurrent = [this, list, &providers, refreshList]() {
+        const int idx = list->currentRow();
+        if (idx < 0 || idx >= providers.size()) return;
+        ProviderConfig copy = providers[idx];
+        if (showProviderEditDialog(&copy, "Edit Provider")) {
+            providers[idx] = copy;
+            refreshList();
+        }
+    };
+    connect(btnEdit, &QPushButton::clicked, &dlg, editCurrent);
+    connect(list, &QListWidget::itemDoubleClicked, &dlg, editCurrent);
+    connect(btnRemove, &QPushButton::clicked, &dlg, [this, list, &providers, refreshList, &dlg]() {
+        const int idx = list->currentRow();
+        if (idx < 0 || idx >= providers.size()) return;
+        QStringList users;
+        for (const auto& p : m_orchestrator->session().participants) {
+            if (p.providerId == providers[idx].id) users << p.handle;
+        }
+        if (!users.isEmpty() &&
+            QMessageBox::question(&dlg, "Remove Provider",
+                                  QStringLiteral("%1 still use %2. Remove it anyway?")
+                                      .arg(users.join(", "), providers[idx].name)) != QMessageBox::Yes) {
+            return;
+        }
+        providers.removeAt(idx);
+        refreshList();
+    });
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    layout->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+    m_orchestrator->setProviders(providers);
+    saveAppSettings();
+    refreshParticipantsList();
+}
+
+bool MainWindow::showProviderEditDialog(ProviderConfig* inOutProvider, const QString& dialogTitle) {
+    QDialog dlg(this);
+    dlg.setWindowTitle(dialogTitle);
+    dlg.resize(560, 300);
+    auto* form = new QFormLayout(&dlg);
+
+    const auto presets = defaultProviderPresets();
+    auto* comboPreset = new QComboBox(&dlg);
+    comboPreset->addItem("-- Custom --");
+    for (const auto& pr : presets) comboPreset->addItem(pr.name);
+
+    auto* editName = new QLineEdit(inOutProvider->name, &dlg);
+    auto* editUrl = new QLineEdit(inOutProvider->baseUrl, &dlg);
+    editUrl->setPlaceholderText("https://api.example.com/v1");
+    auto* editKey = new QLineEdit(inOutProvider->apiKey, &dlg);
+    editKey->setPlaceholderText("$OPENAI_API_KEY, or the key itself");
+    editKey->setEchoMode(inOutProvider->apiKey.startsWith('$') ? QLineEdit::Normal : QLineEdit::Password);
+    editKey->setToolTip("Write $NAME to read the key from environment variable NAME. "
+                        "A key typed here is stored in plain text in Agora's settings file.");
+    connect(editKey, &QLineEdit::textChanged, &dlg, [editKey](const QString& text) {
+        editKey->setEchoMode(text.startsWith('$') ? QLineEdit::Normal : QLineEdit::Password);
+    });
+
+    auto* spinContext = new QSpinBox(&dlg);
+    spinContext->setRange(2000, 2000000);
+    spinContext->setSingleStep(4000);
+    spinContext->setSuffix(" tokens");
+    spinContext->setValue(inOutProvider->contextTokens);
+    spinContext->setToolTip("History sent with each request is trimmed to fit this. "
+                            "Hosted APIs bill per token, so this is also a cost cap per turn.");
+
+    auto models = std::make_shared<QStringList>(inOutProvider->models);
+    auto* btnFetch = new QPushButton("Test connection && fetch models", &dlg);
+    auto* fetchStatus = new QLabel(models->isEmpty() ? QStringLiteral("No models fetched yet.")
+                                                     : QStringLiteral("%1 models known.").arg(models->size()),
+                                   &dlg);
+    fetchStatus->setWordWrap(true);
+
+    connect(comboPreset, &QComboBox::currentIndexChanged, &dlg, [&, presets](int idx) {
+        if (idx <= 0 || idx - 1 >= presets.size()) return;
+        const auto& pr = presets[idx - 1];
+        editName->setText(pr.name);
+        editUrl->setText(pr.baseUrl);
+        if (editKey->text().isEmpty() || editKey->text().startsWith('$')) editKey->setText(pr.apiKeyHint);
+    });
+
+    QPointer<QLabel> statusGuard(fetchStatus);
+    QPointer<QPushButton> fetchGuard(btnFetch);
+    connect(btnFetch, &QPushButton::clicked, &dlg, [this, editUrl, editKey, models, statusGuard, fetchGuard]() {
+        ProviderConfig probe;
+        probe.baseUrl = editUrl->text().trimmed();
+        probe.apiKey = editKey->text().trimmed();
+        if (probe.apiKey.startsWith('$') && probe.resolvedApiKey().isEmpty()) {
+            statusGuard->setText(QStringLiteral("Environment variable %1 is not set for Agora.").arg(probe.apiKey.mid(1)));
+            return;
+        }
+        statusGuard->setText("Connecting…");
+        fetchGuard->setEnabled(false);
+        m_router->fetchProviderModels({probe.baseUrl, probe.resolvedApiKey(), false},
+                                      [models, statusGuard, fetchGuard](bool ok, const QStringList& ids,
+                                                                        const QString& error) {
+            if (!statusGuard || !fetchGuard) return; // dialog already closed
+            fetchGuard->setEnabled(true);
+            if (!ok) {
+                statusGuard->setText("Failed: " + error.left(300));
+                return;
+            }
+            *models = ids;
+            statusGuard->setText(QStringLiteral("Connected: %1 models available.").arg(ids.size()));
+        });
+    });
+
+    form->addRow("Preset:", comboPreset);
+    form->addRow("Name:", editName);
+    form->addRow("Base URL:", editUrl);
+    form->addRow("API Key:", editKey);
+    form->addRow("Context Budget:", spinContext);
+    form->addRow(btnFetch, fetchStatus);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, [&]() {
+        if (editName->text().trimmed().isEmpty() || !QUrl(editUrl->text().trimmed()).isValid() ||
+            !editUrl->text().trimmed().startsWith("http")) {
+            QMessageBox::warning(&dlg, "Provider", "A name and an http(s) base URL are required.");
+            return;
+        }
+        dlg.accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) return false;
+    inOutProvider->name = editName->text().trimmed();
+    inOutProvider->baseUrl = editUrl->text().trimmed();
+    inOutProvider->apiKey = editKey->text().trimmed();
+    inOutProvider->contextTokens = spinContext->value();
+    inOutProvider->models = *models;
+    return true;
+}
+
 void MainWindow::populateDefaultCouncil() {
     auto& parts = m_orchestrator->session().participants;
     parts.clear();
@@ -549,8 +753,12 @@ void MainWindow::refreshParticipantsList() {
     }
 
     for (const auto& p : m_orchestrator->session().participants) {
-        const ModelInfo mi = modelMap.value(p.modelId);
-        const QString stateStr = mi.status.isEmpty() ? QStringLiteral("unloaded") : mi.status;
+        const ModelInfo mi = p.providerId.isEmpty() ? modelMap.value(p.modelId) : ModelInfo{};
+        QString stateStr = mi.status.isEmpty() ? QStringLiteral("unloaded") : mi.status;
+        if (!p.providerId.isEmpty()) {
+            stateStr = m_orchestrator->providerFor(p) ? ("☁ " + providerName(p.providerId))
+                                                      : QStringLiteral("☁ provider missing");
+        }
         const bool isSpeaking = (p.id == m_orchestrator->activeSpeakerId());
         const QString sizeTag = mi.sizeGiB > 0.01
                                     ? QStringLiteral(" · %1 GiB").arg(QString::number(mi.sizeGiB, 'f', 1))
@@ -632,12 +840,53 @@ bool MainWindow::showParticipantDialog(Participant* inOutParticipant, const QStr
 
     auto* editHandle = new QLineEdit(inOutParticipant->handle, &dlg);
     auto* editName = new QLineEdit(inOutParticipant->displayName, &dlg);
+    auto* comboProvider = new QComboBox(&dlg);
+    comboProvider->addItem("Local llama-server router", QString());
+    for (const auto& prov : m_orchestrator->providers()) {
+        comboProvider->addItem("☁ " + prov.name, prov.id);
+    }
+    if (!inOutParticipant->providerId.isEmpty() && comboProvider->findData(inOutParticipant->providerId) < 0) {
+        comboProvider->addItem("☁ (missing provider)", inOutParticipant->providerId);
+    }
+    comboProvider->setCurrentIndex(qMax(0, comboProvider->findData(inOutParticipant->providerId)));
+
     auto* comboModel = new QComboBox(&dlg);
     comboModel->setEditable(true);
-    for (const auto& m : m_availableModels) {
-        comboModel->addItem(m.id);
-    }
-    comboModel->setCurrentText(inOutParticipant->modelId);
+    auto* externalNote = new QLabel(&dlg);
+    externalNote->setWordWrap(true);
+    externalNote->setStyleSheet("color: #fbbf24;");
+
+    auto fillModels = [this, comboProvider, comboModel, externalNote](const QString& keepText) {
+        const QString providerId = comboProvider->currentData().toString();
+        comboModel->clear();
+        if (providerId.isEmpty()) {
+            for (const auto& m : m_availableModels) comboModel->addItem(m.id);
+            externalNote->hide();
+        } else {
+            QString name = comboProvider->currentText();
+            for (const auto& prov : m_orchestrator->providers()) {
+                if (prov.id == providerId) {
+                    comboModel->addItems(prov.models);
+                    name = prov.name;
+                }
+            }
+            externalNote->setText(QStringLiteral(
+                "This participant runs on %1. The room history, including file contents and command "
+                "output from the workspace, is sent to that service with each turn.").arg(name));
+            externalNote->show();
+        }
+        // Keep the model only if this provider offers it; a local GGUF name means nothing to a cloud API
+        if (comboModel->findText(keepText) >= 0 || comboModel->count() == 0) {
+            comboModel->setCurrentText(keepText);
+        } else {
+            comboModel->setCurrentIndex(0);
+        }
+    };
+    fillModels(inOutParticipant->modelId);
+    comboModel->setCurrentText(inOutParticipant->modelId); // as saved, even if no longer listed
+    connect(comboProvider, &QComboBox::currentIndexChanged, &dlg, [fillModels, comboModel](int) {
+        fillModels(comboModel->currentText());
+    });
 
     auto* editColor = new QLineEdit(inOutParticipant->colorHex, &dlg);
     auto* spinTemp = new QDoubleSpinBox(&dlg);
@@ -663,7 +912,9 @@ bool MainWindow::showParticipantDialog(Participant* inOutParticipant, const QStr
     form->addRow("Role Preset:", comboPreset);
     form->addRow("Handle (@mention):", editHandle);
     form->addRow("Display Name:", editName);
-    form->addRow("Local Model:", comboModel);
+    form->addRow("Provider:", comboProvider);
+    form->addRow("Model:", comboModel);
+    form->addRow("", externalNote);
     form->addRow("Badge Color Hex:", editColor);
     form->addRow("Temperature:", spinTemp);
     form->addRow("", chkEnabled);
@@ -682,6 +933,7 @@ bool MainWindow::showParticipantDialog(Participant* inOutParticipant, const QStr
     inOutParticipant->handle = handle;
     inOutParticipant->displayName = editName->text().trimmed();
     inOutParticipant->modelId = comboModel->currentText().trimmed();
+    inOutParticipant->providerId = comboProvider->currentData().toString();
     inOutParticipant->colorHex = editColor->text().trimmed();
     inOutParticipant->temperature = spinTemp->value();
     inOutParticipant->enabled = chkEnabled->isChecked();

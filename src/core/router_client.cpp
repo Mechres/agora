@@ -20,13 +20,24 @@ LlamaRouterClient::LlamaRouterClient(QObject* parent)
       m_routerScriptPath(QDir::homePath() + "/llama-scripts/serve-router.sh") {}
 
 QNetworkRequest LlamaRouterClient::makeRequest(const QString& path, int transferTimeoutMs) const {
-    QString base = m_baseUrl;
+    return makeRequestTo(m_baseUrl, path, m_apiKey, transferTimeoutMs);
+}
+
+QNetworkRequest LlamaRouterClient::makeRequestTo(const QString& baseUrl, const QString& path,
+                                                 const QString& apiKey, int transferTimeoutMs) {
+    QString base = baseUrl.trimmed();
     while (base.endsWith('/')) base.chop(1);
-    QNetworkRequest req(QUrl(base + path));
+    const QUrl url(base + path);
+    QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     req.setTransferTimeout(transferTimeoutMs);
-    if (!m_apiKey.isEmpty()) {
-        req.setRawHeader("Authorization", ("Bearer " + m_apiKey).toUtf8());
+    if (!apiKey.isEmpty()) {
+        req.setRawHeader("Authorization", ("Bearer " + apiKey).toUtf8());
+        // Anthropic's chat endpoint takes the Bearer key, but its /models wants these
+        if (url.host().endsWith("anthropic.com")) {
+            req.setRawHeader("x-api-key", apiKey.toUtf8());
+            req.setRawHeader("anthropic-version", "2023-06-01");
+        }
     }
     return req;
 }
@@ -65,7 +76,13 @@ void LlamaRouterClient::sendRequest(const QString& method,
                                     const QByteArray& body,
                                     int timeoutMs,
                                     RequestCallback done) {
-    QNetworkRequest req = makeRequest(path, timeoutMs);
+    sendRequest(method, makeRequest(path, timeoutMs), body, std::move(done));
+}
+
+void LlamaRouterClient::sendRequest(const QString& method,
+                                    const QNetworkRequest& req,
+                                    const QByteArray& body,
+                                    RequestCallback done) {
     QNetworkReply* reply = (method == "POST") ? m_nam.post(req, body) : m_nam.get(req);
     m_pendingRequests.append(reply);
 
@@ -366,22 +383,28 @@ QVector<ToolCall> LlamaRouterClient::finalizedToolCalls() const {
 void LlamaRouterClient::startChatStream(const QString& modelId,
                                         const QJsonArray& messages,
                                         const QJsonArray& tools,
-                                        double temperature) {
+                                        double temperature,
+                                        const std::optional<ChatEndpoint>& external) {
     abortActiveStream();
     resetStreamState();
 
     QJsonObject payload;
     payload["model"] = modelId;
-    payload["messages"] = messages;
+    payload["messages"] = external ? sanitizeMessagesForExternal(messages) : messages;
     payload["stream"] = true;
-    payload["temperature"] = temperature;
+    if (!external || !external->omitTemperature) {
+        payload["temperature"] = temperature;
+    }
     payload["stream_options"] = QJsonObject{{"include_usage", true}};
     if (!tools.isEmpty()) {
         payload["tools"] = tools;
         payload["tool_choice"] = "auto";
     }
 
-    QNetworkRequest req = makeRequest("/v1/chat/completions", m_streamIdleTimeoutMs);
+    QNetworkRequest req = external
+                              ? makeRequestTo(external->baseUrl, "/chat/completions", external->apiKey,
+                                              m_streamIdleTimeoutMs)
+                              : makeRequest("/v1/chat/completions", m_streamIdleTimeoutMs);
     req.setRawHeader("Accept", "text/event-stream");
 
     m_activeReply = m_nam.post(req, QJsonDocument(payload).toJson(QJsonDocument::Compact));
@@ -450,6 +473,50 @@ void LlamaRouterClient::startChatStream(const QString& modelId,
 
         emit streamFinished(cleanedContent, m_accumReasoning, finalCalls);
     });
+}
+
+void LlamaRouterClient::fetchProviderModels(const ChatEndpoint& endpoint, ProviderModelsCallback done) {
+    sendRequest("GET", makeRequestTo(endpoint.baseUrl, "/models", endpoint.apiKey, 20000), {},
+                [done = std::move(done)](bool ok, const QByteArray& payload, const QString& error) {
+        if (!done) return;
+        if (!ok) {
+            done(false, {}, error);
+            return;
+        }
+        const QStringList models = parseProviderModels(payload);
+        if (models.isEmpty()) {
+            done(false, {}, QStringLiteral("The server answered but listed no models."));
+            return;
+        }
+        done(true, models, {});
+    });
+}
+
+QStringList LlamaRouterClient::parseProviderModels(const QByteArray& modelsJson) {
+    const QJsonObject root = QJsonDocument::fromJson(modelsJson).object();
+    // OpenAI-style {"data":[{"id":...}]}; Ollama's native {"models":[{"name":...}]} as a courtesy
+    QJsonArray arr = root["data"].toArray();
+    if (arr.isEmpty()) arr = root["models"].toArray();
+    QStringList ids;
+    for (const auto& v : arr) {
+        const QJsonObject m = v.toObject();
+        QString id = m["id"].toString();
+        if (id.isEmpty()) id = m["name"].toString();
+        if (id.startsWith("models/")) id = id.mid(7); // Gemini prefixes ids
+        if (!id.isEmpty() && !ids.contains(id)) ids.append(id);
+    }
+    ids.sort(Qt::CaseInsensitive);
+    return ids;
+}
+
+QJsonArray LlamaRouterClient::sanitizeMessagesForExternal(const QJsonArray& messages) {
+    QJsonArray out;
+    for (const auto& v : messages) {
+        QJsonObject m = v.toObject();
+        if (m["role"].toString() == "tool") m.remove("name");
+        out.append(m);
+    }
+    return out;
 }
 
 void LlamaRouterClient::abortActiveStream() {
@@ -523,7 +590,9 @@ void LlamaRouterClient::handleSsePayload(const QByteArray& jsonBytes) {
 
     const QJsonObject delta = choice0["delta"].toObject();
 
-    const QString rDelta = delta["reasoning_content"].toString();
+    // reasoning_content: llama.cpp, DeepSeek; reasoning: OpenRouter, Ollama
+    QString rDelta = delta["reasoning_content"].toString();
+    if (rDelta.isEmpty()) rDelta = delta["reasoning"].toString();
     if (!rDelta.isEmpty()) {
         m_accumReasoning += rDelta;
         emit streamReasoningDelta(rDelta);

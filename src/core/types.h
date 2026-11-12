@@ -23,6 +23,68 @@ struct ModelInfo {
     bool failed = false;
 };
 
+// An external OpenAI-compatible chat API (OpenAI, Anthropic, Gemini, OpenRouter, Ollama, ...).
+// Participants with an empty providerId use the local llama-server router instead.
+struct ProviderConfig {
+    QString id;
+    QString name;           // e.g. "OpenAI"
+    QString baseUrl;        // up to and including the version, e.g. "https://api.openai.com/v1"
+    QString apiKey;         // the key itself, or "$ENV_VAR" to read it from the environment
+    int contextTokens = 32000; // history sent per request; caps cost as well as fitting the window
+    QStringList models;     // last fetched from GET {baseUrl}/models
+
+    // "$NAME" -> value of environment variable NAME; anything else is the key itself
+    QString resolvedApiKey() const {
+        const QString key = apiKey.trimmed();
+        if (key.startsWith('$') && key.size() > 1) {
+            return qEnvironmentVariable(key.mid(1).toUtf8().constData()).trimmed();
+        }
+        return key;
+    }
+
+    QJsonObject toJson() const {
+        QJsonObject obj;
+        obj["id"] = id;
+        obj["name"] = name;
+        obj["baseUrl"] = baseUrl;
+        obj["apiKey"] = apiKey;
+        obj["contextTokens"] = contextTokens;
+        obj["models"] = QJsonArray::fromStringList(models);
+        return obj;
+    }
+
+    static ProviderConfig fromJson(const QJsonObject& obj) {
+        ProviderConfig p;
+        p.id = obj["id"].toString();
+        p.name = obj["name"].toString();
+        p.baseUrl = obj["baseUrl"].toString();
+        p.apiKey = obj["apiKey"].toString();
+        p.contextTokens = obj["contextTokens"].toInt(32000);
+        for (const auto& v : obj["models"].toArray()) p.models.append(v.toString());
+        return p;
+    }
+};
+
+struct ProviderPreset {
+    QString name;
+    QString baseUrl;
+    QString apiKeyHint; // suggested environment variable
+};
+
+inline QVector<ProviderPreset> defaultProviderPresets() {
+    return {
+        {"OpenAI", "https://api.openai.com/v1", "$OPENAI_API_KEY"},
+        {"Anthropic", "https://api.anthropic.com/v1", "$ANTHROPIC_API_KEY"},
+        {"Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "$GEMINI_API_KEY"},
+        {"OpenRouter", "https://openrouter.ai/api/v1", "$OPENROUTER_API_KEY"},
+        {"Groq", "https://api.groq.com/openai/v1", "$GROQ_API_KEY"},
+        {"DeepSeek", "https://api.deepseek.com/v1", "$DEEPSEEK_API_KEY"},
+        {"Mistral", "https://api.mistral.ai/v1", "$MISTRAL_API_KEY"},
+        {"Ollama (local)", "http://127.0.0.1:11434/v1", ""},
+        {"LM Studio (local)", "http://127.0.0.1:1234/v1", ""},
+    };
+}
+
 struct Participant {
     QString id;
     QString handle;       // e.g. "@architect", "@coder", "@reviewer"
@@ -32,10 +94,12 @@ struct Participant {
     QString colorHex = "#60a5fa";
     double temperature = 0.7;
     bool enabled = true;
+    QString providerId;   // external ProviderConfig id; empty = local llama-server router
 
     QJsonObject toJson() const {
         QJsonObject obj;
         obj["id"] = id;
+        if (!providerId.isEmpty()) obj["providerId"] = providerId;
         obj["handle"] = handle;
         obj["displayName"] = displayName;
         obj["modelId"] = modelId;
@@ -49,6 +113,7 @@ struct Participant {
     static Participant fromJson(const QJsonObject& obj) {
         Participant p;
         p.id = obj["id"].toString();
+        p.providerId = obj["providerId"].toString();
         p.handle = obj["handle"].toString();
         p.displayName = obj["displayName"].toString();
         p.modelId = obj["modelId"].toString();

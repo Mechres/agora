@@ -69,8 +69,11 @@ private slots:
     void testCheckpointsLeaveUserRepoUntouched();
     void testStreamStatsParsedFromFinalChunk();
     void testPolicyHelpers();
+    void testProviderConfigAndMessageShape();
     void testEndToEndApprovalRetryCheckpointDone();
     void testDeniedToolAndStopDuringApproval();
+    void testExternalProviderParticipant();
+    void testFetchProviderModels();
 };
 
 void AgoraFlowTest::testStartCommandIsAsyncAndConcurrent() {
@@ -236,6 +239,83 @@ void AgoraFlowTest::testPolicyHelpers() {
 
     // A model that packs fewer chars per token gets a smaller character budget
     QVERIFY(Orchestrator::contextCharBudget(32768, 2.0) < Orchestrator::contextCharBudget(32768, 4.0));
+
+    // External API errors
+    QVERIFY(Orchestrator::isContextOverflowError("HTTP 400: context_length_exceeded"));
+    QVERIFY(Orchestrator::isTemperatureRejectedError(
+        "HTTP 400: Unsupported value: 'temperature' does not support 0.7 with this model."));
+    QVERIFY(!Orchestrator::isTemperatureRejectedError("HTTP 400: invalid model"));
+    QVERIFY(Orchestrator::isTransientError("HTTP 429: Rate limit reached"));
+    QVERIFY(Orchestrator::isTransientError("HTTP 529: Overloaded"));
+    QVERIFY(Orchestrator::isTransientError("HTTP 503: Service Unavailable"));
+    QVERIFY(!Orchestrator::isTransientError("HTTP 401: invalid api key"));
+    QVERIFY(!Orchestrator::isTransientError("HTTP 400: max_tokens 1429: too large"));
+}
+
+void AgoraFlowTest::testProviderConfigAndMessageShape() {
+    ProviderConfig prov;
+    prov.id = "p1";
+    prov.name = "Cloud";
+    prov.baseUrl = "https://api.example.com/v1";
+    prov.apiKey = "$AGORA_TEST_KEY_2";
+    prov.contextTokens = 64000;
+    prov.models = {"a", "b"};
+    const ProviderConfig back = ProviderConfig::fromJson(prov.toJson());
+    QCOMPARE(back.baseUrl, prov.baseUrl);
+    QCOMPARE(back.contextTokens, 64000);
+    QCOMPARE(back.models, prov.models);
+
+    qputenv("AGORA_TEST_KEY_2", " from-env \n");
+    QCOMPARE(back.resolvedApiKey(), QString("from-env"));
+    qunsetenv("AGORA_TEST_KEY_2");
+    QCOMPARE(back.resolvedApiKey(), QString());
+    prov.apiKey = "sk-literal";
+    QCOMPARE(prov.resolvedApiKey(), QString("sk-literal"));
+
+    // Participants keep their provider across save/load; old sessions load as local
+    Participant p;
+    p.id = "x";
+    p.providerId = "p1";
+    QCOMPARE(Participant::fromJson(p.toJson()).providerId, QString("p1"));
+    QVERIFY(Participant::fromJson(QJsonObject{{"id", "y"}}).providerId.isEmpty());
+    QCOMPARE(Orchestrator::modelKey(p), QString("p1/"));
+
+    // Model lists: OpenAI style, Gemini's "models/" prefix, Ollama's native shape
+    QCOMPARE(LlamaRouterClient::parseProviderModels(R"({"data":[{"id":"z"},{"id":"a"},{"id":"a"}]})"),
+             (QStringList{"a", "z"}));
+    QCOMPARE(LlamaRouterClient::parseProviderModels(R"({"data":[{"id":"models/gemini-x"}]})"),
+             QStringList{"gemini-x"});
+    QCOMPARE(LlamaRouterClient::parseProviderModels(R"({"models":[{"name":"llama3"}]})"), QStringList{"llama3"});
+
+    // A tool call that never got a result (run stopped mid-tool) is left out entirely
+    Participant coder;
+    coder.id = "c";
+    coder.handle = "@coder";
+    ChatMessage task;
+    task.senderId = "user";
+    task.content = "do it";
+    ChatMessage turn;
+    turn.id = "t";
+    turn.senderId = "c";
+    turn.content = "working";
+    turn.toolCalls = {{"done_1", "list_files", "{}"}, {"dangling_2", "write_file", "{}"}};
+    turn.toolResults = {{"done_1", "list_files", "a.txt", false, 0}};
+    const QJsonArray msgs = LlamaRouterClient::sanitizeMessagesForExternal(
+        Orchestrator::buildMessagesForSpeaker(coder, {coder}, {task, turn}));
+    int toolMsgs = 0;
+    for (const auto& v : msgs) {
+        const QJsonObject m = v.toObject();
+        if (m["role"] == "assistant") {
+            const QJsonArray calls = m["tool_calls"].toArray();
+            QCOMPARE(calls.size(), 1);
+            QCOMPARE(calls[0].toObject()["id"].toString(), QString("done_1"));
+        }
+        if (m["role"] == "tool") {
+            ++toolMsgs;
+            QVERIFY(!m.contains("name"));
+        }
+    }
+    QCOMPARE(toolMsgs, 1);
 }
 
 void AgoraFlowTest::testEndToEndApprovalRetryCheckpointDone() {
@@ -354,6 +434,116 @@ void AgoraFlowTest::testDeniedToolAndStopDuringApproval() {
     orch.resolveToolApproval(requested.first().at(0).toULongLong(), ToolApprovalDecision::AllowOnce);
     QTest::qWait(200);
     QVERIFY(!QFileInfo::exists(ws.filePath("x.txt"))); // late approval after stop is ignored
+}
+
+void AgoraFlowTest::testExternalProviderParticipant() {
+    QTemporaryDir ws;
+    FakeLlamaServer server("unused-local-model");
+    // Tool call, then the API rejects our temperature, then a rate limit, then the answer
+    server.enqueueChat({200, FakeLlamaServer::sse("Looking first.", "list_files", {{"path", "."}})});
+    server.enqueueChat({400, R"({"error":{"message":"Unsupported value: 'temperature' does not support 0.4 )"
+                             R"(with this model. Only the default (1) value is supported.","code":"unsupported_value"}})"});
+    server.enqueueChat({429, R"({"error":{"message":"Rate limit reached","type":"rate_limit_error"}})"});
+    server.enqueueChat({200, FakeLlamaServer::sse("The workspace is empty. [DONE]", {}, {}, 900, 20)});
+
+    qputenv("AGORA_TEST_PROVIDER_KEY", "secret-123");
+    ProviderConfig prov;
+    prov.id = "prov_test";
+    prov.name = "Test Cloud";
+    prov.baseUrl = server.baseUrl() + "/v1";
+    prov.apiKey = "$AGORA_TEST_PROVIDER_KEY";
+    prov.contextTokens = 16000;
+
+    BwrapSandbox sandbox(ws.path());
+    ToolEngine tools(&sandbox);
+    LlamaRouterClient router;
+    router.setBaseUrl("http://127.0.0.1:1"); // the local router must never be contacted
+    router.setApiKey("local-key");
+    Orchestrator orch(&router, &tools);
+    orch.setAutoCheckpoints(false);
+    orch.setTransientRetryDelayMs(100);
+    orch.setProviders({prov});
+
+    RoomSession s = singleCoderSession(ws.path());
+    s.participants[0].providerId = prov.id;
+    s.participants[0].modelId = "cloud-model";
+    s.participants[0].temperature = 0.4;
+    orch.setSession(s);
+    orch.addUserMessage("What is in the workspace?");
+
+    orch.startDebate();
+    QTRY_VERIFY_WITH_TIMEOUT(!orch.isRunning(), 30000);
+
+    const auto& msgs = orch.session().messages;
+    QVERIFY2(msgs.last().content.contains("The workspace is empty"), qPrintable(msgs.last().content));
+    QCOMPARE(msgs.last().modelId, QString("cloud-model"));
+    QCOMPARE(msgs.last().stats.modelPrepMs, 0);
+
+    // Only chat requests, all to the provider with its key; no load/unload/props
+    QCOMPARE(server.chatRequests().size(), 4);
+    for (const auto& rec : server.requestLog()) {
+        QCOMPARE(rec.method, QByteArray("POST"));
+        QCOMPARE(rec.path, QByteArray("/v1/chat/completions"));
+        QCOMPARE(rec.authorization, QByteArray("Bearer secret-123"));
+    }
+
+    const auto& reqs = server.chatRequests();
+    QCOMPARE(reqs[0]["model"].toString(), QString("cloud-model"));
+    QCOMPARE(reqs[0]["temperature"].toDouble(), 0.4);
+    QVERIFY(!reqs[2].contains("temperature")); // dropped after the rejection...
+    QVERIFY(!reqs[3].contains("temperature")); // ...and stays dropped
+
+    // The follow-up carries the tool exchange without llama.cpp's extra "name" field
+    bool sawToolMsg = false;
+    for (const auto& v : reqs[1]["messages"].toArray()) {
+        const QJsonObject m = v.toObject();
+        if (m["role"].toString() != "tool") continue;
+        sawToolMsg = true;
+        QVERIFY(!m.contains("name"));
+        QVERIFY(!m["tool_call_id"].toString().isEmpty());
+    }
+    QVERIFY(sawToolMsg);
+
+    // Calibration is tracked per provider, so a local model of the same name isn't affected
+    QVERIFY(orch.charsPerTokenFor("prov_test/cloud-model") != Orchestrator::kDefaultCharsPerToken);
+    QCOMPARE(orch.charsPerTokenFor("cloud-model"), Orchestrator::kDefaultCharsPerToken);
+
+    // A participant whose provider was removed fails clearly instead of hitting the router
+    orch.setProviders({});
+    QSignalSpy errors(&orch, &Orchestrator::errorNotification);
+    orch.addUserMessage("again");
+    orch.startDebate();
+    QTRY_VERIFY_WITH_TIMEOUT(!orch.isRunning(), 10000);
+    QCOMPARE(errors.size(), 1);
+    QVERIFY(errors.first().at(0).toString().contains("no longer configured"));
+    qunsetenv("AGORA_TEST_PROVIDER_KEY");
+}
+
+void AgoraFlowTest::testFetchProviderModels() {
+    FakeLlamaServer server("cloud-model-a");
+    LlamaRouterClient router;
+    bool done = false;
+    bool ok = false;
+    QStringList models;
+    router.fetchProviderModels({server.baseUrl() + "/v1/", "k", false},
+                               [&](bool okIn, const QStringList& m, const QString&) {
+        ok = okIn;
+        models = m;
+        done = true;
+    });
+    QTRY_VERIFY(done);
+    QVERIFY(ok);
+    QCOMPARE(models, QStringList{"cloud-model-a"});
+    QCOMPARE(server.requestLog().first().path, QByteArray("/v1/models"));
+
+    done = false;
+    router.fetchProviderModels({"http://127.0.0.1:1/v1", "k", false},
+                               [&](bool okIn, const QStringList&, const QString&) {
+        ok = okIn;
+        done = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(done, 10000);
+    QVERIFY(!ok);
 }
 
 QTEST_GUILESS_MAIN(AgoraFlowTest)

@@ -47,8 +47,20 @@ void Orchestrator::setSession(const RoomSession& s) {
     emit debateStateChanged(false, m_completedTurns, m_session.maxRounds);
 }
 
-double Orchestrator::charsPerTokenFor(const QString& modelId) const {
-    return m_charsPerToken.value(modelId, kDefaultCharsPerToken);
+const ProviderConfig* Orchestrator::providerFor(const Participant& p) const {
+    if (p.providerId.isEmpty()) return nullptr;
+    for (const auto& prov : m_providers) {
+        if (prov.id == p.providerId) return &prov;
+    }
+    return nullptr;
+}
+
+QString Orchestrator::modelKey(const Participant& p) {
+    return p.providerId.isEmpty() ? p.modelId : (p.providerId + '/' + p.modelId);
+}
+
+double Orchestrator::charsPerTokenFor(const QString& modelKey) const {
+    return m_charsPerToken.value(modelKey, kDefaultCharsPerToken);
 }
 
 QStringList Orchestrator::extractMentions(const QString& text,
@@ -174,9 +186,21 @@ bool Orchestrator::needsApproval(ToolApprovalPolicy policy,
 
 bool Orchestrator::isContextOverflowError(const QString& errorText) {
     const QString e = errorText.toLower();
-    return e.contains("exceed_context_size") ||
+    return e.contains("exceed_context_size") || e.contains("context_length_exceeded") ||
            (e.contains("context") && (e.contains("exceed") || e.contains("too long") ||
                                       e.contains("maximum context length")));
+}
+
+bool Orchestrator::isTemperatureRejectedError(const QString& errorText) {
+    const QString e = errorText.toLower();
+    return e.contains("temperature") &&
+           (e.contains("unsupported") || e.contains("not support") || e.contains("only the default"));
+}
+
+bool Orchestrator::isTransientError(const QString& errorText) {
+    static const QRegularExpression serverError(QStringLiteral("^HTTP (429|500|502|503|504|529):"));
+    const QString e = errorText.toLower();
+    return serverError.match(errorText).hasMatch() || e.contains("overloaded") || e.contains("rate limit");
 }
 
 QJsonArray Orchestrator::buildMessagesForSpeaker(const Participant& speaker,
@@ -226,9 +250,14 @@ QJsonArray Orchestrator::buildMessagesForSpeaker(const Participant& speaker,
             QJsonObject assistantMsg;
             assistantMsg["role"] = "assistant";
             assistantMsg["content"] = msg.content;
+            // Only calls that got a result: a run stopped mid-tool leaves one dangling, and
+            // hosted APIs reject a tool_call without a matching tool message
+            QSet<QString> answered;
+            for (const auto& tr : msg.toolResults) answered.insert(tr.toolCallId);
             if (!msg.toolCalls.isEmpty()) {
                 QJsonArray tcArr;
                 for (const auto& tc : msg.toolCalls) {
+                    if (!answered.contains(tc.id)) continue;
                     QJsonObject fn;
                     fn["name"] = tc.name;
                     fn["arguments"] = tc.argumentsJson;
@@ -238,7 +267,7 @@ QJsonArray Orchestrator::buildMessagesForSpeaker(const Participant& speaker,
                     item["function"] = fn;
                     tcArr.append(item);
                 }
-                assistantMsg["tool_calls"] = tcArr;
+                if (!tcArr.isEmpty()) assistantMsg["tool_calls"] = tcArr;
             }
             items.append(assistantMsg);
 
@@ -483,12 +512,24 @@ void Orchestrator::beginTurn(const Participant& speaker) {
     m_turnPrepMs = 0;
     m_budgetOverride = 0;
     m_contextRetryUsed = false;
+    m_transientRetryUsed = false;
     m_activeSpeakerId = speaker.id;
     emit activeSpeakerChanged(speaker.id, speaker.handle, speaker.modelId);
     appendPendingMessage(speaker);
 
     auto prepareModel = [this, genId, speaker]() {
         if (!alive(genId)) return;
+        if (!speaker.providerId.isEmpty()) {
+            // External APIs host their own models: nothing to load or evict
+            if (!providerFor(speaker)) {
+                dropEmptyPlaceholder();
+                endRun(QStringLiteral("%1 uses an external provider that is no longer configured. "
+                                      "Pick a provider in the participant settings.").arg(speaker.handle), true);
+                return;
+            }
+            startStream(0);
+            return;
+        }
         emit statusNotification(QStringLiteral("Preparing %1 (%2)...").arg(speaker.handle, speaker.modelId));
         m_router->ensureModelReady(speaker.modelId, m_session.vramBudgetGiB,
                                    [this, genId](bool ok, const QString& log, qint64 elapsedMs) {
@@ -521,8 +562,10 @@ void Orchestrator::startStream(int toolDepth) {
     const Participant& speaker = m_turnSpeaker;
     emit statusNotification(QStringLiteral("%1 (%2) is speaking...").arg(speaker.handle, speaker.modelId));
 
-    int budget = contextCharBudget(m_router->cachedContextLength(speaker.modelId),
-                                   charsPerTokenFor(speaker.modelId));
+    const ProviderConfig* provider = providerFor(speaker);
+    const QString key = modelKey(speaker);
+    const int contextTokens = provider ? provider->contextTokens : m_router->cachedContextLength(speaker.modelId);
+    int budget = contextCharBudget(contextTokens, charsPerTokenFor(key));
     if (m_budgetOverride > 0) budget = qMin(budget, m_budgetOverride);
     m_lastBudget = budget;
 
@@ -535,7 +578,18 @@ void Orchestrator::startStream(int toolDepth) {
         m_lastSentChars += v.toObject()["content"].toString().size();
     }
 
-    m_router->startChatStream(speaker.modelId, messages, tools, speaker.temperature);
+    std::optional<ChatEndpoint> endpoint;
+    if (provider) {
+        endpoint = ChatEndpoint{provider->baseUrl, provider->resolvedApiKey(), m_omitTemperature.contains(key)};
+    }
+    m_router->startChatStream(speaker.modelId, messages, tools, speaker.temperature, endpoint);
+}
+
+void Orchestrator::clearPartialReply() {
+    ChatMessage& msg = m_session.messages[m_activeMessageIndex];
+    msg.content.clear();
+    msg.reasoningContent.clear();
+    emit messageUpdated(m_activeMessageIndex, msg);
 }
 
 void Orchestrator::onModelStreamError(const QString& error) {
@@ -547,16 +601,38 @@ void Orchestrator::onModelStreamError(const QString& error) {
         // Retry once with much less history, and remember the model packs fewer chars per token
         m_contextRetryUsed = true;
         m_budgetOverride = static_cast<int>(m_lastBudget * 0.6);
-        const QString model = m_turnSpeaker.modelId;
-        m_charsPerToken[model] = charsPerTokenFor(model) * 0.6;
+        const QString key = modelKey(m_turnSpeaker);
+        m_charsPerToken[key] = charsPerTokenFor(key) * 0.6;
 
-        ChatMessage& msg = m_session.messages[m_activeMessageIndex];
-        msg.content.clear();
-        msg.reasoningContent.clear();
-        emit messageUpdated(m_activeMessageIndex, msg);
+        clearPartialReply();
         emit statusNotification(QStringLiteral("Context window exceeded; retrying %1 with less history...")
                                     .arg(m_turnSpeaker.handle));
         startStream(m_currentToolDepth);
+        return;
+    }
+
+    const QString key = modelKey(m_turnSpeaker);
+    if (!m_turnSpeaker.providerId.isEmpty() && !m_omitTemperature.contains(key) &&
+        isTemperatureRejectedError(error)) {
+        // Reasoning models (e.g. OpenAI o-series) accept only their default temperature
+        m_omitTemperature.insert(key);
+        clearPartialReply();
+        emit statusNotification(QStringLiteral("%1 doesn't accept a temperature; retrying without it...")
+                                    .arg(m_turnSpeaker.modelId));
+        startStream(m_currentToolDepth);
+        return;
+    }
+
+    if (!m_transientRetryUsed && isTransientError(error)) {
+        m_transientRetryUsed = true;
+        clearPartialReply();
+        const quint64 genId = m_generationId;
+        emit statusNotification(QStringLiteral("%1: %2 Retrying in %3 s...")
+                                    .arg(m_turnSpeaker.handle, error.left(160),
+                                         QString::number(m_transientRetryDelayMs / 1000.0, 'g', 2)));
+        QTimer::singleShot(m_transientRetryDelayMs, this, [this, genId]() {
+            if (alive(genId)) startStream(m_currentToolDepth);
+        });
         return;
     }
 
@@ -582,7 +658,7 @@ void Orchestrator::onModelStreamFinished(const QString& content,
     msg.stats = m_router->lastStreamStats();
     msg.stats.modelPrepMs = (m_currentToolDepth == 0) ? m_turnPrepMs : 0;
     if (msg.stats.promptTokens > 0 && m_lastSentChars > 0) {
-        const QString model = m_turnSpeaker.modelId;
+        const QString model = modelKey(m_turnSpeaker);
         const double measured = static_cast<double>(m_lastSentChars) / msg.stats.promptTokens;
         m_charsPerToken[model] = m_charsPerToken.contains(model)
                                      ? 0.5 * m_charsPerToken[model] + 0.5 * measured
@@ -590,6 +666,7 @@ void Orchestrator::onModelStreamFinished(const QString& content,
     }
     m_budgetOverride = 0;
     m_contextRetryUsed = false;
+    m_transientRetryUsed = false;
     emit messageUpdated(msgIdx, msg);
 
     if (!toolCalls.isEmpty() && m_currentToolDepth < m_maxToolDepth) {

@@ -399,9 +399,9 @@ void AgoraCoreTest::testFallbackToolCallExtraction() {
 }
 
 void AgoraCoreTest::testMentionRoutingAndRoundRobin() {
-    Participant pArch{"id_arch", "@architect", "Architect", "ModelA", "sys", "#38bdf8", 0.6, true};
-    Participant pCode{"id_code", "@coder", "Coder", "ModelB", "sys", "#4ade80", 0.4, true};
-    Participant pRev{"id_rev", "@reviewer", "Reviewer", "ModelC", "sys", "#f472b6", 0.5, true};
+    Participant pArch{"id_arch", "@architect", "Architect", "ModelA", "sys", "#38bdf8", 0.6, true, {}};
+    Participant pCode{"id_code", "@coder", "Coder", "ModelB", "sys", "#4ade80", 0.4, true, {}};
+    Participant pRev{"id_rev", "@reviewer", "Reviewer", "ModelC", "sys", "#f472b6", 0.5, true, {}};
     QVector<Participant> roster = {pArch, pCode, pRev};
 
     // 1. User mentions @coder explicitly -> @coder speaks first
@@ -436,8 +436,8 @@ void AgoraCoreTest::testMentionRoutingAndRoundRobin() {
 }
 
 void AgoraCoreTest::testPerspectiveFormattingAndContextBudget() {
-    Participant pArch{"id_arch", "@architect", "Architect", "ModelA", "sys", "#38bdf8", 0.6, true};
-    Participant pCode{"id_code", "@coder", "Coder", "ModelB", "sys", "#4ade80", 0.4, true};
+    Participant pArch{"id_arch", "@architect", "Architect", "ModelA", "sys", "#38bdf8", 0.6, true, {}};
+    Participant pCode{"id_code", "@coder", "Coder", "ModelB", "sys", "#4ade80", 0.4, true, {}};
     QVector<Participant> roster = {pArch, pCode};
 
     ChatMessage m1;
@@ -503,8 +503,8 @@ void AgoraCoreTest::testContextBudgetFromModelProps() {
     QVERIFY(Orchestrator::contextCharBudget(32768) < 32768 * 4);
 
     // When trimming, the pinned turn is the first *user* message, not whatever came first
-    Participant pArch{"id_arch", "@architect", "Architect", "ModelA", "sys", "#38bdf8", 0.6, true};
-    Participant pCode{"id_code", "@coder", "Coder", "ModelB", "sys", "#4ade80", 0.4, true};
+    Participant pArch{"id_arch", "@architect", "Architect", "ModelA", "sys", "#38bdf8", 0.6, true, {}};
+    Participant pCode{"id_code", "@coder", "Coder", "ModelB", "sys", "#4ade80", 0.4, true, {}};
     QVector<ChatMessage> history;
     ChatMessage opener;
     opener.id = "o";

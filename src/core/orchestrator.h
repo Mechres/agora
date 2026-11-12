@@ -35,6 +35,7 @@ public:
     static constexpr int kDefaultMaxContextChars = 48000;
     static constexpr double kDefaultCharsPerToken = 3.0;
     static constexpr int kDefaultMaxToolDepth = 8;
+    static constexpr int kDefaultTransientRetryDelayMs = 5000;
 
     explicit Orchestrator(LlamaRouterClient* router,
                           ToolEngine* toolEngine,
@@ -55,11 +56,21 @@ public:
     void setMaxToolDepth(int depth) { m_maxToolDepth = qBound(1, depth, 100); }
     int maxToolDepth() const { return m_maxToolDepth; }
 
+    void setTransientRetryDelayMs(int ms) { m_transientRetryDelayMs = qMax(0, ms); }
+
     void setToolApprovalPolicy(ToolApprovalPolicy policy) { m_approvalPolicy = policy; }
     ToolApprovalPolicy toolApprovalPolicy() const { return m_approvalPolicy; }
 
-    // Learned from usage.prompt_tokens; kDefaultCharsPerToken until the model has replied once
-    double charsPerTokenFor(const QString& modelId) const;
+    // External OpenAI-compatible APIs that participants can use instead of the local router
+    void setProviders(const QVector<ProviderConfig>& providers) { m_providers = providers; }
+    const QVector<ProviderConfig>& providers() const { return m_providers; }
+    // nullptr for local participants and for unknown provider ids
+    const ProviderConfig* providerFor(const Participant& p) const;
+
+    // Learned from usage.prompt_tokens; kDefaultCharsPerToken until the model has replied once.
+    // Keyed by modelKey(): the model id, prefixed with the provider id for external models.
+    double charsPerTokenFor(const QString& modelKey) const;
+    static QString modelKey(const Participant& p);
 
     static QStringList extractMentions(const QString& text,
                                        const QVector<Participant>& participants,
@@ -79,6 +90,9 @@ public:
                               const QString& toolName,
                               const QSet<QString>& approvedForSession);
     static bool isContextOverflowError(const QString& errorText);
+    static bool isTemperatureRejectedError(const QString& errorText);
+    // Rate limits and overload: worth one retry after a pause
+    static bool isTransientError(const QString& errorText);
 
     void addUserMessage(const QString& text);
     void startDebate();
@@ -114,6 +128,7 @@ private:
                                const QString& reasoning,
                                const QVector<ToolCall>& toolCalls);
     void onModelStreamError(const QString& error);
+    void clearPartialReply();
     void runToolCall(int messageIndex, const QVector<ToolCall>& calls, int callIndex, quint64 genId);
     void finalizeTurn(int messageIndex, quint64 genId);
 
@@ -125,10 +140,12 @@ private:
     ToolEngine* m_toolEngine = nullptr;
     CheckpointStore* m_checkpoints = nullptr;
     RoomSession m_session;
+    QVector<ProviderConfig> m_providers;
 
     // Settings
     bool m_autoCheckpoints = true;
     int m_maxToolDepth = kDefaultMaxToolDepth;
+    int m_transientRetryDelayMs = kDefaultTransientRetryDelayMs;
     ToolApprovalPolicy m_approvalPolicy = ToolApprovalPolicy::Off;
 
     // Run state
@@ -149,8 +166,10 @@ private:
     int m_lastBudget = 0;
     int m_budgetOverride = 0;
     bool m_contextRetryUsed = false;
+    bool m_transientRetryUsed = false;
 
     QHash<QString, double> m_charsPerToken;
+    QSet<QString> m_omitTemperature; // model keys whose API rejected our temperature
 
     // Tool approval
     QSet<QString> m_sessionApprovedTools;

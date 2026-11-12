@@ -12,8 +12,16 @@
 #include <QString>
 #include <QVector>
 #include <functional>
+#include <optional>
 
 namespace agora {
+
+// Target of a chat request when it isn't the local router: an external OpenAI-compatible API
+struct ChatEndpoint {
+    QString baseUrl;  // up to and including the version, e.g. "https://api.openai.com/v1"
+    QString apiKey;   // already resolved (no "$ENV" references)
+    bool omitTemperature = false; // some reasoning models reject any temperature
+};
 
 class LlamaRouterClient : public QObject {
     Q_OBJECT
@@ -64,10 +72,19 @@ public:
 
     bool startRouterScript(QString* errorOut = nullptr);
 
+    // Streams from the local router, or from an external API when an endpoint is given
     void startChatStream(const QString& modelId,
                          const QJsonArray& messages,
                          const QJsonArray& tools,
-                         double temperature);
+                         double temperature,
+                         const std::optional<ChatEndpoint>& external = std::nullopt);
+
+    // GET {baseUrl}/models of an external API; model ids sorted
+    using ProviderModelsCallback = std::function<void(bool ok, const QStringList& models, const QString& error)>;
+    void fetchProviderModels(const ChatEndpoint& endpoint, ProviderModelsCallback done);
+    static QStringList parseProviderModels(const QByteArray& modelsJson);
+    // Hosted APIs validate strictly: drop the llama.cpp-only "name" field from tool messages
+    static QJsonArray sanitizeMessagesForExternal(const QJsonArray& messages);
     void abortActiveStream();
     bool isStreaming() const { return m_activeReply != nullptr; }
 
@@ -99,12 +116,15 @@ private:
     };
 
     QNetworkRequest makeRequest(const QString& path, int transferTimeoutMs = 30000) const;
+    static QNetworkRequest makeRequestTo(const QString& baseUrl, const QString& path,
+                                         const QString& apiKey, int transferTimeoutMs);
     using RequestCallback = std::function<void(bool ok, const QByteArray& payload, const QString& error)>;
     void sendRequest(const QString& method,
                      const QString& path,
                      const QByteArray& body,
                      int timeoutMs,
                      RequestCallback done);
+    void sendRequest(const QString& method, const QNetworkRequest& req, const QByteArray& body, RequestCallback done);
     static QString extractHttpErrorDetail(QNetworkReply* reply, const QByteArray& responseBody);
     void processSseBuffer(bool flushAll = false);
     void handleSsePayload(const QByteArray& jsonBytes);
