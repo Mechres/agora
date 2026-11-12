@@ -217,6 +217,7 @@ QVector<ModelInfo> LlamaRouterClient::fetchModelsBlocking(bool* routerOnlineOut,
 }
 
 bool LlamaRouterClient::unloadModelBlocking(const QString& modelId, QString* errorOut) {
+    m_contextLengthCache.remove(modelId); // may come back with different launch args
     QJsonObject body;
     body["model"] = modelId;
     return sendBlockingRequest(
@@ -276,6 +277,26 @@ bool LlamaRouterClient::ensureModelReady(const QString& targetModelId, double vr
 
     fetchModelsBlocking();
     return true;
+}
+
+int LlamaRouterClient::parseContextLengthFromProps(const QByteArray& propsJson) {
+    const QJsonObject root = QJsonDocument::fromJson(propsJson).object();
+    const int nested = root["default_generation_settings"].toObject()["n_ctx"].toInt(0);
+    return nested > 0 ? nested : root["n_ctx"].toInt(0);
+}
+
+int LlamaRouterClient::contextLengthForModel(const QString& modelId) {
+    if (const auto it = m_contextLengthCache.constFind(modelId); it != m_contextLengthCache.constEnd()) {
+        return it.value();
+    }
+    QByteArray payload;
+    const QString path = "/props?model=" + QString::fromUtf8(QUrl::toPercentEncoding(modelId));
+    if (!sendBlockingRequest("GET", path, {}, 3000, &payload, nullptr)) {
+        return 0; // not cached: the model may simply not be up yet
+    }
+    const int nCtx = parseContextLengthFromProps(payload);
+    m_contextLengthCache.insert(modelId, nCtx);
+    return nCtx;
 }
 
 bool LlamaRouterClient::startRouterScript(QString* errorOut) {
@@ -343,7 +364,7 @@ void LlamaRouterClient::startChatStream(const QString& modelId,
         payload["tool_choice"] = "auto";
     }
 
-    QNetworkRequest req = makeRequest("/v1/chat/completions", /*transferTimeoutMs=*/90000);
+    QNetworkRequest req = makeRequest("/v1/chat/completions", m_streamIdleTimeoutMs);
     req.setRawHeader("Accept", "text/event-stream");
 
     m_activeReply = m_nam.post(req, QJsonDocument(payload).toJson(QJsonDocument::Compact));

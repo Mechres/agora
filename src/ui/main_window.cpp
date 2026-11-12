@@ -138,6 +138,13 @@ void MainWindow::loadAppSettings() {
     m_router->setApiKey(settings.value("router/apiKey", m_router->apiKey()).toString());
     m_router->setModelsDir(settings.value("router/modelsDir", m_router->modelsDir()).toString());
     m_router->setRouterScriptPath(settings.value("router/scriptPath", m_router->routerScriptPath()).toString());
+    m_router->setStreamIdleTimeoutMs(
+        settings.value("router/streamIdleTimeoutSec", m_router->streamIdleTimeoutMs() / 1000).toInt() * 1000);
+
+    SandboxLimits limits = m_sandbox->limits();
+    limits.memoryMaxMiB = settings.value("sandbox/memoryMaxMiB", limits.memoryMaxMiB).toInt();
+    limits.tasksMax = settings.value("sandbox/tasksMax", limits.tasksMax).toInt();
+    m_sandbox->setLimits(limits);
 }
 
 void MainWindow::saveAppSettings() {
@@ -146,6 +153,9 @@ void MainWindow::saveAppSettings() {
     settings.setValue("router/apiKey", m_router->apiKey());
     settings.setValue("router/modelsDir", m_router->modelsDir());
     settings.setValue("router/scriptPath", m_router->routerScriptPath());
+    settings.setValue("router/streamIdleTimeoutSec", m_router->streamIdleTimeoutMs() / 1000);
+    settings.setValue("sandbox/memoryMaxMiB", m_sandbox->limits().memoryMaxMiB);
+    settings.setValue("sandbox/tasksMax", m_sandbox->limits().tasksMax);
 }
 
 void MainWindow::setupUi() {
@@ -365,7 +375,7 @@ void MainWindow::onStartRouterClicked() {
 void MainWindow::onOpenSettingsClicked() {
     QDialog dlg(this);
     dlg.setWindowTitle("Agora Settings");
-    dlg.resize(520, 220);
+    dlg.resize(520, 320);
 
     auto* form = new QFormLayout(&dlg);
     auto* editUrl = new QLineEdit(m_router->baseUrl(), &dlg);
@@ -378,6 +388,30 @@ void MainWindow::onOpenSettingsClicked() {
     form->addRow("Local GGUF Models Folder:", editModelsDir);
     form->addRow("Router Start Script:", editScript);
 
+    auto* spinStreamTimeout = new QSpinBox(&dlg);
+    spinStreamTimeout->setRange(10, 3600);
+    spinStreamTimeout->setSuffix(" s");
+    spinStreamTimeout->setValue(m_router->streamIdleTimeoutMs() / 1000);
+    spinStreamTimeout->setToolTip("Abort a model reply after this long with no data. "
+                                  "Must cover prompt processing of the largest model.");
+    form->addRow("Stream Idle Timeout:", spinStreamTimeout);
+
+    auto* spinSandboxMem = new QSpinBox(&dlg);
+    spinSandboxMem->setRange(256, 262144);
+    spinSandboxMem->setSingleStep(256);
+    spinSandboxMem->setSuffix(" MiB");
+    spinSandboxMem->setValue(m_sandbox->limits().memoryMaxMiB);
+    form->addRow("Sandbox Memory Limit:", spinSandboxMem);
+
+    auto* spinSandboxTasks = new QSpinBox(&dlg);
+    spinSandboxTasks->setRange(16, 65536);
+    spinSandboxTasks->setValue(m_sandbox->limits().tasksMax);
+    spinSandboxTasks->setEnabled(BwrapSandbox::cgroupLimitsAvailable());
+    spinSandboxTasks->setToolTip(BwrapSandbox::cgroupLimitsAvailable()
+                                     ? "Maximum processes/threads per sandboxed command."
+                                     : "Unavailable: needs a systemd user session (systemd-run --user --scope).");
+    form->addRow("Sandbox Process Limit:", spinSandboxTasks);
+
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -389,6 +423,11 @@ void MainWindow::onOpenSettingsClicked() {
     m_router->setApiKey(editKey->text());
     m_router->setModelsDir(editModelsDir->text());
     m_router->setRouterScriptPath(editScript->text());
+    m_router->setStreamIdleTimeoutMs(spinStreamTimeout->value() * 1000);
+    SandboxLimits limits = m_sandbox->limits();
+    limits.memoryMaxMiB = spinSandboxMem->value();
+    limits.tasksMax = spinSandboxTasks->value();
+    m_sandbox->setLimits(limits);
     saveAppSettings();
     onRefreshModels();
 }

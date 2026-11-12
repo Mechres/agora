@@ -33,6 +33,7 @@ public:
                                                         const QVector<ChatMessage>& history,
                                                         DebateMode mode,
                                                         int* roundRobinIndexInOut);
+    static int contextCharBudget(int contextTokens);
     static QJsonArray buildMessagesForSpeaker(const Participant& speaker,
                                               const QVector<Participant>& allParticipants,
                                               const QVector<ChatMessage>& history,

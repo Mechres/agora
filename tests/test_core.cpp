@@ -9,6 +9,7 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QProcess>
 #include <QTemporaryDir>
 #include <QtTest>
 #include <unistd.h>
@@ -23,10 +24,14 @@ private slots:
     void testGitConfigFsmonitorEscapeBlocked();
     void testSandboxWritePatchRunAndDiff();
     void testSandboxOutputTruncationAndHardening();
+    void testExistingRepoConfigPreserved();
+    void testSandboxCanCommitButNotTouchConfigOrHooks();
+    void testSandboxResourceLimits();
     void testPatchAmbiguityAndReadLineTotals();
     void testFallbackToolCallExtraction();
     void testMentionRoutingAndRoundRobin();
     void testPerspectiveFormattingAndContextBudget();
+    void testContextBudgetFromModelProps();
     void testSseParserAndFormatArgSafety();
     void testVramEvictionPlanner();
     void testSqliteSessionStore();
@@ -226,12 +231,121 @@ void AgoraCoreTest::testSandboxOutputTruncationAndHardening() {
     QVERIFY(!args.contains("/etc/shadow"));
 
     if (BwrapSandbox::isBwrapAvailable()) {
-        // Output > 64 KiB should be truncated cleanly without hanging or OOM
-        const SandboxRunResult flood = sandbox.runCommand("python3 -c \"print('X' * 150000)\"", 5000);
+        // Output > 64 KiB is capped, but the command must keep running to completion and
+        // report its real exit code (a long build log must not abort the build)
+        const SandboxRunResult flood = sandbox.runCommand(
+            "seq 1 200000; echo finished > after_flood.txt; exit 3", 10000);
         QVERIFY(flood.truncated);
-        QVERIFY(flood.stdoutText.size() <= BwrapSandbox::kMaxOutputBytes + 128);
-        QVERIFY(flood.stdoutText.contains("output truncated at 64 KiB"));
+        QVERIFY(flood.stdoutText.toUtf8().size() <= BwrapSandbox::kMaxOutputBytes);
+        QVERIFY(flood.combinedOutput().contains("output truncated"));
+        QCOMPARE(flood.exitCode, 3);
+        QVERIFY(QFileInfo::exists(tmpDir.filePath("after_flood.txt")));
+
+        // Cut point must not split a multi-byte UTF-8 character
+        const SandboxRunResult utf = sandbox.runCommand(
+            "python3 -c \"print('\u00e7' * 100000)\"", 10000);
+        QVERIFY(utf.truncated);
+        QVERIFY(!utf.stdoutText.contains(QChar::ReplacementCharacter));
     }
+}
+
+void AgoraCoreTest::testExistingRepoConfigPreserved() {
+    if (!BwrapSandbox::isBwrapAvailable()) {
+        QSKIP("bwrap not installed");
+    }
+
+    QTemporaryDir wsDir;
+    QVERIFY(wsDir.isValid());
+    auto hostGit = [&](const QStringList& args) {
+        QProcess git;
+        git.setWorkingDirectory(wsDir.path());
+        git.start("git", args);
+        git.waitForFinished(5000);
+        return QString::fromUtf8(git.readAllStandardOutput()).trimmed();
+    };
+    hostGit({"init", "-q"});
+    hostGit({"remote", "add", "origin", "git@example.com:me/project.git"});
+    hostGit({"config", "user.name", "Real User"});
+
+    // Choosing a real project as the workspace must not rewrite its .git/config
+    BwrapSandbox sandbox(wsDir.path());
+    QVERIFY(sandbox.ensureWorkspaceInitialized());
+    sandbox.runCommand("true", 5000);
+    sandbox.gitDiff();
+
+    QCOMPARE(hostGit({"remote", "get-url", "origin"}), QString("git@example.com:me/project.git"));
+    QCOMPARE(hostGit({"config", "user.name"}), QString("Real User"));
+}
+
+void AgoraCoreTest::testSandboxCanCommitButNotTouchConfigOrHooks() {
+    if (!BwrapSandbox::isBwrapAvailable()) {
+        QSKIP("bwrap not installed");
+    }
+
+    QTemporaryDir wsDir;
+    QVERIFY(wsDir.isValid());
+    BwrapSandbox sandbox(wsDir.path());
+    QVERIFY(sandbox.ensureWorkspaceInitialized());
+
+    const SandboxRunResult commit = sandbox.runCommand(
+        "echo hi > a.txt && git add a.txt && git commit -qm 'agent commit' && git log --format=%an -1", 10000);
+    QVERIFY2(commit.exitCode == 0, qPrintable(commit.combinedOutput()));
+    QCOMPARE(commit.stdoutText.trimmed(), QString("Agora Sandbox"));
+
+    const QByteArray cfgBefore = [&] {
+        QFile f(wsDir.filePath(".git/config"));
+        return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+    }();
+    QVERIFY(sandbox.runCommand("git config core.pager 'touch /tmp/x'", 5000).exitCode != 0);
+    QVERIFY(sandbox.runCommand("echo evil > .git/hooks/post-commit", 5000).exitCode != 0);
+    QVERIFY(sandbox.runCommand("rm -rf .git/hooks", 5000).exitCode != 0);
+    QFile cfg(wsDir.filePath(".git/config"));
+    QVERIFY(cfg.open(QIODevice::ReadOnly));
+    QCOMPARE(cfg.readAll(), cfgBefore);
+    QVERIFY(!QFileInfo::exists(wsDir.filePath(".git/hooks/post-commit")));
+}
+
+void AgoraCoreTest::testSandboxResourceLimits() {
+    if (!BwrapSandbox::isBwrapAvailable()) {
+        QSKIP("bwrap not installed");
+    }
+
+    QTemporaryDir wsDir;
+    QVERIFY(wsDir.isValid());
+    BwrapSandbox sandbox(wsDir.path());
+    SandboxLimits limits;
+    limits.memoryMaxMiB = 256;
+    limits.tasksMax = 32;
+    sandbox.setLimits(limits);
+
+    // Allocating and touching 1 GiB must fail under a 256 MiB limit (bytearray(n) would be
+    // lazily zeroed pages that never count against the limit)
+    const SandboxRunResult mem = sandbox.runCommand(
+        "python3 -c \"b = b'x' * (1024 ** 3); print('allocated')\"", 20000);
+    QVERIFY2(mem.exitCode != 0, qPrintable(mem.combinedOutput()));
+    QVERIFY(!mem.stdoutText.contains("allocated"));
+
+    // A long-running command is no longer killed by a fixed CPU-time ulimit
+    QVERIFY(!sandbox.buildBwrapArgs("true").last().contains("ulimit -t"));
+
+    if (!BwrapSandbox::cgroupLimitsAvailable()) {
+        QSKIP("systemd user scope unavailable; task limit not enforced");
+    }
+    // Count how many processes can be spawned under a 32-task limit
+    const SandboxRunResult tasks = sandbox.runCommand(
+        "python3 -c \"\n"
+        "import subprocess\n"
+        "ps = []\n"
+        "try:\n"
+        "    for i in range(100): ps.append(subprocess.Popen(['sleep', '5']))\n"
+        "except OSError: pass\n"
+        "print(len(ps))\n"
+        "for p in ps: p.kill()\n"
+        "\"", 20000);
+    bool ok = false;
+    const int spawned = tasks.stdoutText.trimmed().toInt(&ok);
+    QVERIFY2(ok, qPrintable(tasks.combinedOutput()));
+    QVERIFY2(spawned < limits.tasksMax, qPrintable(tasks.stdoutText));
 }
 
 void AgoraCoreTest::testPatchAmbiguityAndReadLineTotals() {
@@ -376,6 +490,46 @@ void AgoraCoreTest::testPerspectiveFormattingAndContextBudget() {
     }
     const QJsonArray budgeted = Orchestrator::buildMessagesForSpeaker(pCode, roster, longHistory, "/workspace", /*maxContextChars=*/6000);
     QVERIFY(budgeted.size() < 15);
+}
+
+void AgoraCoreTest::testContextBudgetFromModelProps() {
+    QCOMPARE(LlamaRouterClient::parseContextLengthFromProps(
+                 R"({"default_generation_settings":{"n_ctx":32768}})"), 32768);
+    QCOMPARE(LlamaRouterClient::parseContextLengthFromProps(R"({"n_ctx":8192})"), 8192);
+    QCOMPARE(LlamaRouterClient::parseContextLengthFromProps("not json"), 0);
+
+    QCOMPARE(Orchestrator::contextCharBudget(0), Orchestrator::kDefaultMaxContextChars);
+    QVERIFY(Orchestrator::contextCharBudget(32768) > Orchestrator::contextCharBudget(8192));
+    QVERIFY(Orchestrator::contextCharBudget(32768) < 32768 * 4);
+
+    // When trimming, the pinned turn is the first *user* message, not whatever came first
+    Participant pArch{"id_arch", "@architect", "Architect", "ModelA", "sys", "#38bdf8", 0.6, true};
+    Participant pCode{"id_code", "@coder", "Coder", "ModelB", "sys", "#4ade80", 0.4, true};
+    QVector<ChatMessage> history;
+    ChatMessage opener;
+    opener.id = "o";
+    opener.senderId = pArch.id;
+    opener.senderHandle = pArch.handle;
+    opener.content = "OPENER " + QString(500, QChar('o'));
+    history.append(opener);
+    ChatMessage task;
+    task.id = "t";
+    task.senderId = "user";
+    task.senderHandle = "@you";
+    task.content = "THE TASK";
+    history.append(task);
+    for (int i = 0; i < 20; ++i) {
+        ChatMessage m;
+        m.id = QString::number(i);
+        m.senderId = (i % 2 == 0) ? pArch.id : pCode.id;
+        m.senderHandle = (i % 2 == 0) ? pArch.handle : pCode.handle;
+        m.content = QString(1000, QChar('x'));
+        history.append(m);
+    }
+    const QJsonArray out = Orchestrator::buildMessagesForSpeaker(pCode, {pArch, pCode}, history, "/workspace", 6000);
+    const QString all = QString::fromUtf8(QJsonDocument(out).toJson());
+    QVERIFY(all.contains("THE TASK"));
+    QVERIFY(!all.contains("OPENER"));
 }
 
 void AgoraCoreTest::testSseParserAndFormatArgSafety() {

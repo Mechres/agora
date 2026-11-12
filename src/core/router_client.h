@@ -3,6 +3,7 @@
 #include "core/types.h"
 
 #include <QJsonArray>
+#include <QHash>
 #include <QMap>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
@@ -18,7 +19,10 @@ class LlamaRouterClient : public QObject {
 public:
     explicit LlamaRouterClient(QObject* parent = nullptr);
 
-    void setBaseUrl(const QString& url) { m_baseUrl = url.trimmed(); }
+    void setBaseUrl(const QString& url) {
+        m_baseUrl = url.trimmed();
+        m_contextLengthCache.clear();
+    }
     QString baseUrl() const { return m_baseUrl; }
 
     void setApiKey(const QString& key) { m_apiKey = key.trimmed(); }
@@ -30,6 +34,11 @@ public:
     void setRouterScriptPath(const QString& path) { m_routerScriptPath = path.trimmed(); }
     QString routerScriptPath() const { return m_routerScriptPath; }
 
+    // llama-server sends nothing while processing the prompt, so this must cover the
+    // slowest prompt prefill of the largest model, not just the gap between tokens.
+    void setStreamIdleTimeoutMs(int ms) { m_streamIdleTimeoutMs = qMax(10000, ms); }
+    int streamIdleTimeoutMs() const { return m_streamIdleTimeoutMs; }
+
     static QStringList planEvictionsForModel(const QVector<ModelInfo>& models,
                                              const QString& targetModelId,
                                              double vramBudgetGiB);
@@ -39,6 +48,10 @@ public:
     bool unloadModelBlocking(const QString& modelId, QString* errorOut = nullptr);
     bool loadModelBlocking(const QString& modelId, QString* errorOut = nullptr);
     bool ensureModelReady(const QString& targetModelId, double vramBudgetGiB, QString* statusLogOut = nullptr);
+    // Context window (tokens) of a loaded model via GET /props?model=..., cached per model.
+    // Returns 0 when the router does not report it.
+    int contextLengthForModel(const QString& modelId);
+    static int parseContextLengthFromProps(const QByteArray& propsJson);
 
     bool startRouterScript(QString* errorOut = nullptr);
 
@@ -89,6 +102,8 @@ private:
     QString m_apiKey = "sk-local";
     QString m_modelsDir;
     QString m_routerScriptPath;
+    int m_streamIdleTimeoutMs = 600000;
+    QHash<QString, int> m_contextLengthCache;
     QNetworkAccessManager m_nam;
 
     QPointer<QNetworkReply> m_activeReply;

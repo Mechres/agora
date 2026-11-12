@@ -158,6 +158,13 @@ std::optional<Participant> Orchestrator::selectNextSpeaker(const QVector<Partici
     return chosen;
 }
 
+int Orchestrator::contextCharBudget(int contextTokens) {
+    if (contextTokens <= 0) return kDefaultMaxContextChars;
+    // ~3 chars per token for code-heavy text; leave a quarter of the window for the tool
+    // schema and the reply.
+    return qMax(8000, contextTokens / 4 * 9);
+}
+
 QJsonArray Orchestrator::buildMessagesForSpeaker(const Participant& speaker,
                                                  const QVector<Participant>& allParticipants,
                                                  const QVector<ChatMessage>& history,
@@ -272,16 +279,20 @@ QJsonArray Orchestrator::buildMessagesForSpeaker(const Participant& speaker,
         totalChars += turnSizes[i];
     }
 
-    // If totalChars exceeds budget, keep turn 0 (if it's the initial user task and fits)
-    // plus as many recent turns from the end as fit within budget.
+    // If totalChars exceeds budget, keep the first user message (the task) if it fits
+    // in half the budget, plus as many recent turns from the end as fit.
     QVector<bool> keep(validHistory.size(), true);
     int droppedCount = 0;
     if (totalChars > budget && validHistory.size() > 1) {
         keep.fill(false);
         int used = 0;
-        if (turnSizes[0] < budget / 2) {
-            keep[0] = true;
-            used += turnSizes[0];
+        for (int i = 0; i < validHistory.size(); ++i) {
+            if (validHistory[i].senderId != "user") continue;
+            if (turnSizes[i] < budget / 2) {
+                keep[i] = true;
+                used += turnSizes[i];
+            }
+            break;
         }
         for (int i = validHistory.size() - 1; i >= 0; --i) {
             if (keep[i]) continue;
@@ -464,7 +475,8 @@ void Orchestrator::launchSpeakerTurn(const Participant& speaker, int messageInde
     emit statusNotification(QStringLiteral("%1 (%2) is speaking...").arg(speaker.handle, speaker.modelId));
 
     const QJsonArray messages = buildMessagesForSpeaker(
-        speaker, m_session.participants, m_session.messages, m_session.workspacePath);
+        speaker, m_session.participants, m_session.messages, m_session.workspacePath,
+        contextCharBudget(m_router->contextLengthForModel(speaker.modelId)));
     const QJsonArray tools = (toolDepth < m_maxToolDepth)
                                  ? ToolEngine::openAiToolsSchema()
                                  : QJsonArray{};

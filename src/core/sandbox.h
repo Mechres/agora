@@ -26,6 +26,12 @@ struct SandboxRunResult {
     }
 };
 
+struct SandboxLimits {
+    int memoryMaxMiB = 4096;   // per command, includes all children
+    int tasksMax = 512;        // processes + threads per command
+    int maxFileSizeMiB = 64;   // largest single file a command may write
+};
+
 class BwrapSandbox : public QObject {
     Q_OBJECT
 public:
@@ -39,17 +45,21 @@ public:
     void setAllowNetwork(bool allow) { m_allowNetwork = allow; }
     bool allowNetwork() const { return m_allowNetwork; }
 
+    void setLimits(const SandboxLimits& limits) { m_limits = limits; }
+    SandboxLimits limits() const { return m_limits; }
+
     bool ensureWorkspaceInitialized(QString* errorOut = nullptr);
     static bool isBwrapAvailable();
+    // True when memory/task limits are enforced by a systemd user scope (cgroup v2).
+    // Otherwise only an address-space ulimit is applied and task count is unlimited.
+    static bool cgroupLimitsAvailable();
 
-    QStringList buildBwrapArgs(const QString& shellCommand,
-                               bool protectGitDir = true,
-                               bool applyResourceLimits = true) const;
+    QStringList buildBwrapArgs(const QString& shellCommand, bool applyResourceLimits = true) const;
     SandboxRunResult runCommand(const QString& shellCommand, int timeoutMs = 30000);
     void cancelRunningCommand();
 
-    QString gitDiff() const;
-    QString gitStatusShort() const;
+    QString gitDiff();
+    QString gitStatusShort();
 
 signals:
     void commandStarted(const QString& command);
@@ -59,13 +69,14 @@ signals:
 private:
     SandboxRunResult runInternal(const QString& shellCommand,
                                  int timeoutMs,
-                                 bool protectGitDir,
                                  bool applyResourceLimits,
-                                 bool emitUiSignals) const;
+                                 bool emitUiSignals);
 
     QString m_workspacePath;
     bool m_allowNetwork = false;
-    mutable QPointer<QProcess> m_activeProcess;
+    SandboxLimits m_limits;
+    // Several commands can be in flight at once (nested event loops), so track all of them
+    QList<QPointer<QProcess>> m_activeProcesses;
 };
 
 } // namespace agora
