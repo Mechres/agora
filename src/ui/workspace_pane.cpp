@@ -181,6 +181,16 @@ void WorkspacePane::clearSelectedFile() {
 }
 
 void WorkspacePane::refreshViews() {
+    if (!m_refreshTimer) {
+        m_refreshTimer = new QTimer(this);
+        m_refreshTimer->setSingleShot(true);
+        m_refreshTimer->setInterval(150);
+        connect(m_refreshTimer, &QTimer::timeout, this, &WorkspacePane::doRefresh);
+    }
+    m_refreshTimer->start();
+}
+
+void WorkspacePane::doRefresh() {
     const QString ws = m_sandbox->workspacePath();
     m_listFiles->clear();
     if (ws.isEmpty() || !QDir(ws).exists()) return;
@@ -210,7 +220,11 @@ void WorkspacePane::refreshViews() {
         }
     }
 
-    m_diffViewer->setPlainText(m_sandbox->gitDiff());
+    // Only the newest request may update the view; older ones can finish out of order
+    const quint64 seq = ++m_diffRequestSeq;
+    m_sandbox->gitStatusAndDiffAsync([this, seq](const QString&, const QString& diff) {
+        if (seq == m_diffRequestSeq) m_diffViewer->setPlainText(diff);
+    });
 }
 
 void WorkspacePane::onFileSelected(QListWidgetItem* item) {
@@ -235,16 +249,18 @@ void WorkspacePane::onSaveEditorFileClicked() {
     args["path"] = m_currentSelectedFileRelPath;
     args["content"] = m_codeEditor->toPlainText();
     tc.argumentsJson = QString::fromUtf8(QJsonDocument(args).toJson(QJsonDocument::Compact));
-    const ToolResult res = m_toolEngine->executeToolCall(tc);
-    emit statusMessage(res.output);
+    m_toolEngine->executeToolCallAsync(tc, [this](const ToolResult& res) {
+        emit statusMessage(res.output);
+    });
 }
 
 void WorkspacePane::onRunManualSandboxCmd() {
     const QString cmd = m_editManualCmd->text().trimmed();
     if (cmd.isEmpty()) return;
     m_editManualCmd->clear();
-    m_sandbox->runCommand(cmd, 30000);
-    refreshViews();
+    m_sandbox->startCommand(cmd, 30000, [this](const SandboxRunResult&) {
+        refreshViews();
+    });
 }
 
 } // namespace agora

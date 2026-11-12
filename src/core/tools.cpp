@@ -2,11 +2,13 @@
 
 #include <QDir>
 #include <QDirIterator>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
+#include <QTimer>
 #include <QUuid>
 
 #include <fcntl.h>
@@ -219,25 +221,49 @@ std::optional<QString> ToolEngine::resolveSafeWorkspacePath(const QString& relat
     return QString::fromStdString(candStr);
 }
 
-ToolResult ToolEngine::executeToolCall(const ToolCall& call) {
+bool ToolEngine::isReadOnlyTool(const QString& toolName) {
+    return toolName == "list_files" || toolName == "read_file" || toolName == "git_diff";
+}
+
+void ToolEngine::executeToolCallAsync(const ToolCall& call, std::function<void(const ToolResult&)> done) {
     QJsonParseError err;
     const QJsonDocument doc = QJsonDocument::fromJson(call.argumentsJson.toUtf8(), &err);
     const QJsonObject args = doc.isObject() ? doc.object() : QJsonObject{};
 
-    if (call.name == "list_files") return execListFiles(call.id, args);
-    if (call.name == "read_file") return execReadFile(call.id, args);
-    if (call.name == "write_file") return execWriteFile(call.id, args);
-    if (call.name == "patch_file") return execPatchFile(call.id, args);
-    if (call.name == "run_command") return execRunCommand(call.id, args);
-    if (call.name == "git_diff") return execGitDiff(call.id);
+    if (call.name == "run_command") {
+        execRunCommandAsync(call.id, args, std::move(done));
+        return;
+    }
+    if (call.name == "git_diff") {
+        execGitDiffAsync(call.id, std::move(done));
+        return;
+    }
 
+    // File tools touch the local disk directly and finish quickly
     ToolResult tr;
-    tr.toolCallId = call.id;
-    tr.name = call.name;
-    tr.isError = true;
-    tr.exitCode = 1;
-    tr.output = "Unknown tool: " + call.name;
-    return tr;
+    if (call.name == "list_files") {
+        tr = execListFiles(call.id, args);
+    } else if (call.name == "read_file") {
+        tr = execReadFile(call.id, args);
+    } else if (call.name == "write_file") {
+        tr = execWriteFile(call.id, args);
+    } else if (call.name == "patch_file") {
+        tr = execPatchFile(call.id, args);
+    } else {
+        tr = {call.id, call.name, "Unknown tool: " + call.name, true, 1};
+    }
+    QTimer::singleShot(0, this, [done = std::move(done), tr]() { done(tr); });
+}
+
+ToolResult ToolEngine::executeToolCall(const ToolCall& call) {
+    ToolResult out;
+    QEventLoop loop;
+    executeToolCallAsync(call, [&](const ToolResult& r) {
+        out = r;
+        loop.quit();
+    });
+    loop.exec();
+    return out;
 }
 
 ToolResult ToolEngine::execListFiles(const QString& callId, const QJsonObject& args) {
@@ -508,39 +534,40 @@ ToolResult ToolEngine::execPatchFile(const QString& callId, const QJsonObject& a
     return tr;
 }
 
-ToolResult ToolEngine::execRunCommand(const QString& callId, const QJsonObject& args) {
-    ToolResult tr{callId, "run_command", {}, false, 0};
+void ToolEngine::execRunCommandAsync(const QString& callId, const QJsonObject& args,
+                                     std::function<void(const ToolResult&)> done) {
     const QString cmd = args["command"].toString().trimmed();
     const int timeoutSec = qBound(1, args["timeout_sec"].toInt(30), 300);
 
     if (cmd.isEmpty()) {
-        tr.isError = true;
-        tr.exitCode = 1;
-        tr.output = "Command is empty";
-        return tr;
+        const ToolResult tr{callId, "run_command", "Command is empty", true, 1};
+        QTimer::singleShot(0, this, [done = std::move(done), tr]() { done(tr); });
+        return;
     }
 
-    const SandboxRunResult runRes = m_sandbox->runCommand(cmd, timeoutSec * 1000);
-    tr.exitCode = runRes.exitCode;
-    tr.isError = (runRes.exitCode != 0);
-    tr.output = runRes.combinedOutput().trimmed();
-    if (tr.output.isEmpty()) {
-        tr.output = QStringLiteral("(command exited with code %1 and no output)").arg(QString::number(runRes.exitCode));
-    }
-    emit workspaceModified(".");
-    return tr;
+    m_sandbox->startCommand(cmd, timeoutSec * 1000, [this, callId, done = std::move(done)](const SandboxRunResult& runRes) {
+        ToolResult tr{callId, "run_command", {}, false, 0};
+        tr.exitCode = runRes.exitCode;
+        tr.isError = (runRes.exitCode != 0);
+        tr.output = runRes.combinedOutput().trimmed();
+        if (tr.output.isEmpty()) {
+            tr.output = QStringLiteral("(command exited with code %1 and no output)").arg(QString::number(runRes.exitCode));
+        }
+        emit workspaceModified(".");
+        done(tr);
+    });
 }
 
-ToolResult ToolEngine::execGitDiff(const QString& callId) {
-    ToolResult tr{callId, "git_diff", {}, false, 0};
-    const QString diff = m_sandbox->gitDiff().trimmed();
-    const QString status = m_sandbox->gitStatusShort().trimmed();
-    if (diff.isEmpty() && status.isEmpty()) {
-        tr.output = "(no uncommitted changes in workspace)";
-    } else {
-        tr.output = (status.isEmpty() ? QString() : ("Status:\n" + status + "\n\n")) + diff;
-    }
-    return tr;
+void ToolEngine::execGitDiffAsync(const QString& callId, std::function<void(const ToolResult&)> done) {
+    m_sandbox->gitStatusAndDiffAsync([callId, done = std::move(done)](const QString& status, const QString& diff) {
+        ToolResult tr{callId, "git_diff", {}, false, 0};
+        if (diff.isEmpty() && status.isEmpty()) {
+            tr.output = "(no uncommitted changes in workspace)";
+        } else {
+            tr.output = (status.isEmpty() ? QString() : ("Status:\n" + status + "\n\n")) + diff;
+        }
+        done(tr);
+    });
 }
 
 } // namespace agora

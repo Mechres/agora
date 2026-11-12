@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/checkpoints.h"
 #include "core/orchestrator.h"
 #include "core/router_client.h"
 #include "core/sandbox.h"
@@ -10,6 +11,9 @@
 #include "ui/workspace_pane.h"
 
 #include <QComboBox>
+#include <QDialog>
+#include <QHash>
+#include <QPointer>
 #include <QDoubleSpinBox>
 #include <QFileSystemWatcher>
 #include <QLabel>
@@ -57,15 +61,19 @@ private:
     void refreshParticipantsList();
     void refreshSessionsList();
     bool showParticipantDialog(Participant* inOutParticipant, const QString& dialogTitle);
+    void showToolApprovalDialog(quint64 requestId, const QString& speakerHandle, const ToolCall& call);
+    void showTurnDiff(int messageIndex);
 
     std::unique_ptr<SessionStore> m_store;
     BwrapSandbox* m_sandbox = nullptr;
+    CheckpointStore* m_checkpoints = nullptr;
     ToolEngine* m_toolEngine = nullptr;
     LlamaRouterClient* m_router = nullptr;
     Orchestrator* m_orchestrator = nullptr;
     QFileSystemWatcher* m_fsWatcher = nullptr;
 
     QVector<ModelInfo> m_availableModels;
+    QHash<quint64, QPointer<QDialog>> m_approvalDialogs;
 
     // Top bar widgets
     QLabel* m_routerBadge = nullptr;

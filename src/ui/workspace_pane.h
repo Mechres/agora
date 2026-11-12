@@ -10,6 +10,7 @@
 #include <QPlainTextEdit>
 #include <QSyntaxHighlighter>
 #include <QTabWidget>
+#include <QTimer>
 #include <QWidget>
 
 namespace agora {
@@ -34,6 +35,7 @@ public:
     void setWorkspacePath(const QString& path);
     void setAllowNetwork(bool allow);
     void clearSelectedFile();
+    // Debounced: bursts of file events collapse into one refresh
     void refreshViews();
 
 signals:
@@ -47,7 +49,11 @@ private slots:
     void onRunManualSandboxCmd();
 
 private:
+    void doRefresh();
+
     BwrapSandbox* m_sandbox = nullptr;
+    QTimer* m_refreshTimer = nullptr;
+    quint64 m_diffRequestSeq = 0;
     ToolEngine* m_toolEngine = nullptr;
     QString m_currentSelectedFileRelPath;
 

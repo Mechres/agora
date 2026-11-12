@@ -6,6 +6,7 @@
 #include <QJsonArray>
 #include <QObject>
 #include <QString>
+#include <functional>
 #include <optional>
 
 namespace agora {
@@ -22,7 +23,14 @@ public:
     static QJsonArray openAiToolsSchema();
     static QVector<ToolCall> extractFallbackToolCalls(const QString& rawText, QString* cleanedTextOut = nullptr);
 
+    // Tools that cannot modify the workspace or run code
+    static bool isReadOnlyTool(const QString& toolName);
+
     std::optional<QString> resolveSafeWorkspacePath(const QString& relativePath, QString* errorOut = nullptr) const;
+    // `done` is always invoked later from the event loop, never synchronously
+    void executeToolCallAsync(const ToolCall& call, std::function<void(const ToolResult&)> done);
+    // Blocking wrapper (spins a local event loop for run_command/git_diff). Tests and
+    // non-GUI callers only.
     ToolResult executeToolCall(const ToolCall& call);
 
 signals:
@@ -33,8 +41,9 @@ private:
     ToolResult execReadFile(const QString& callId, const QJsonObject& args);
     ToolResult execWriteFile(const QString& callId, const QJsonObject& args);
     ToolResult execPatchFile(const QString& callId, const QJsonObject& args);
-    ToolResult execRunCommand(const QString& callId, const QJsonObject& args);
-    ToolResult execGitDiff(const QString& callId);
+    void execRunCommandAsync(const QString& callId, const QJsonObject& args,
+                             std::function<void(const ToolResult&)> done);
+    void execGitDiffAsync(const QString& callId, std::function<void(const ToolResult&)> done);
 
     BwrapSandbox* m_sandbox = nullptr;
 };

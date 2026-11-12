@@ -162,32 +162,44 @@ void BwrapSandbox::cancelRunningCommand() {
     }
 }
 
-SandboxRunResult BwrapSandbox::runCommand(const QString& shellCommand, int timeoutMs) {
-    return runInternal(shellCommand, timeoutMs, /*applyResourceLimits=*/true, /*emitUiSignals=*/true);
+BwrapSandbox::~BwrapSandbox() {
+    // Make sure no callback fires into a half-destroyed owner
+    for (const QPointer<QProcess>& proc : std::as_const(m_activeProcesses)) {
+        if (!proc) continue;
+        proc->disconnect();
+        proc->kill();
+        proc->waitForFinished(1000);
+    }
 }
 
-SandboxRunResult BwrapSandbox::runInternal(const QString& shellCommand,
-                                           int timeoutMs,
-                                           bool applyResourceLimits,
-                                           bool emitUiSignals) {
-    SandboxRunResult res;
+void BwrapSandbox::startCommand(const QString& shellCommand,
+                                int timeoutMs,
+                                CommandCallback done,
+                                SandboxRunOptions options) {
+    auto failLater = [this, done](int exitCode, const QString& message) {
+        QTimer::singleShot(0, this, [done, exitCode, message]() {
+            SandboxRunResult res;
+            res.exitCode = exitCode;
+            res.stderrText = message;
+            if (done) done(res);
+        });
+    };
+
     QString err;
     if (!ensureWorkspaceInitialized(&err)) {
-        res.stderrText = err;
-        res.exitCode = 1;
-        return res;
+        failLater(1, err);
+        return;
     }
 
     const QString bwrapBin = QStandardPaths::findExecutable("bwrap");
     if (bwrapBin.isEmpty()) {
-        res.stderrText = "Error: bubblewrap (/usr/bin/bwrap) is required for sandbox execution.";
-        res.exitCode = 127;
-        return res;
+        failLater(127, "Error: bubblewrap (/usr/bin/bwrap) is required for sandbox execution.");
+        return;
     }
 
     QString program = bwrapBin;
-    QStringList programArgs = buildBwrapArgs(shellCommand, applyResourceLimits);
-    if (applyResourceLimits && cgroupLimitsAvailable()) {
+    QStringList programArgs = buildBwrapArgs(shellCommand, options.applyResourceLimits);
+    if (options.applyResourceLimits && cgroupLimitsAvailable()) {
         // systemd-run --scope execs bwrap in place, so killing our child still kills bwrap
         program = QStringLiteral("systemd-run");
         programArgs = QStringList{
@@ -198,106 +210,141 @@ SandboxRunResult BwrapSandbox::runInternal(const QString& shellCommand,
             "--", bwrapBin} + programArgs;
     }
 
-    res.bwrapUsed = true;
-    if (emitUiSignals) {
+    struct RunState {
+        SandboxRunResult res;
+        qsizetype keptBytes = 0;
+        qsizetype droppedBytes = 0;
+        bool finished = false;
+    };
+    auto state = std::make_shared<RunState>();
+    state->res.bwrapUsed = true;
+
+    auto* proc = new QProcess(this);
+    auto* timer = new QTimer(proc);
+    timer->setSingleShot(true);
+    m_activeProcesses.append(proc);
+    proc->setProcessChannelMode(QProcess::SeparateChannels);
+
+    if (options.emitUiSignals) {
         emit commandStarted(shellCommand);
     }
 
-    QProcess proc;
-    m_activeProcesses.append(&proc);
-    proc.setProcessChannelMode(QProcess::SeparateChannels);
-
-    qsizetype keptBytes = 0;
-    qsizetype droppedBytes = 0;
-
     // Past the cap, keep draining the pipes but discard the bytes: killing the command here
     // would abort long builds/test runs halfway and misreport their result.
-    auto appendCapped = [&](QString& dest, const QByteArray& raw) {
+    auto appendCapped = [this, state, options](QString& dest, const QByteArray& raw) {
+        SandboxRunResult& res = state->res;
         if (res.truncated) {
-            droppedBytes += raw.size();
+            state->droppedBytes += raw.size();
             return;
         }
-        qsizetype take = qMin(raw.size(), kMaxOutputBytes - keptBytes);
+        qsizetype take = qMin(raw.size(), kMaxOutputBytes - state->keptBytes);
         if (take < raw.size()) {
             // Don't split a UTF-8 sequence at the cut point
             while (take > 0 && (static_cast<unsigned char>(raw[take]) & 0xC0) == 0x80) --take;
             res.truncated = true;
-            droppedBytes += raw.size() - take;
+            state->droppedBytes += raw.size() - take;
         }
         if (take > 0) {
             const QString chunk = QString::fromUtf8(raw.left(take));
             dest += chunk;
-            keptBytes += take;
-            if (emitUiSignals) emit commandOutputChunk(chunk);
+            state->keptBytes += take;
+            if (options.emitUiSignals) emit commandOutputChunk(chunk);
         }
-        if (res.truncated && emitUiSignals) {
+        if (res.truncated && options.emitUiSignals) {
             emit commandOutputChunk(QStringLiteral("\n...[output limit reached; further output hidden]...\n"));
         }
     };
 
-    QObject::connect(&proc, &QProcess::readyReadStandardOutput, [&]() {
-        appendCapped(res.stdoutText, proc.readAllStandardOutput());
+    connect(proc, &QProcess::readyReadStandardOutput, this, [proc, state, appendCapped]() {
+        appendCapped(state->res.stdoutText, proc->readAllStandardOutput());
     });
-    QObject::connect(&proc, &QProcess::readyReadStandardError, [&]() {
-        appendCapped(res.stderrText, proc.readAllStandardError());
+    connect(proc, &QProcess::readyReadStandardError, this, [proc, state, appendCapped]() {
+        appendCapped(state->res.stderrText, proc->readAllStandardError());
     });
 
+    auto finish = [this, proc, state, appendCapped, options, timeoutMs, done]() {
+        if (state->finished) return;
+        state->finished = true;
+        m_activeProcesses.removeAll(proc);
+
+        SandboxRunResult& res = state->res;
+        appendCapped(res.stdoutText, proc->readAllStandardOutput());
+        appendCapped(res.stderrText, proc->readAllStandardError());
+
+        if (res.truncated) {
+            res.stderrText += QStringLiteral("\n[output truncated: first %1 KiB shown, %2 bytes omitted]")
+                                  .arg(QString::number(kMaxOutputBytes / 1024), QString::number(state->droppedBytes));
+        }
+        if (res.timedOut) {
+            res.exitCode = 124;
+            res.stderrText += QStringLiteral("\n[Sandbox timeout after %1 ms]").arg(QString::number(timeoutMs));
+        } else if (proc->error() == QProcess::FailedToStart) {
+            res.exitCode = 127;
+            res.stderrText += "\n[Failed to start sandbox: " + proc->errorString() + "]";
+        } else {
+            res.exitCode = proc->exitStatus() == QProcess::NormalExit ? proc->exitCode() : 1;
+        }
+
+        if (options.emitUiSignals) {
+            emit commandFinished(res.exitCode, res.combinedOutput());
+        }
+        proc->deleteLater();
+        if (done) done(res);
+    };
+
+    connect(proc, &QProcess::finished, this, finish);
+    connect(proc, &QProcess::errorOccurred, this, [finish](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart) finish(); // otherwise finished() follows
+    });
+    connect(timer, &QTimer::timeout, this, [proc, state]() {
+        state->res.timedOut = true;
+        proc->kill(); // finished() follows
+    });
+
+    timer->start(qMax(500, timeoutMs));
+    proc->start(program, programArgs);
+}
+
+SandboxRunResult BwrapSandbox::runCommand(const QString& shellCommand, int timeoutMs) {
+    SandboxRunResult out;
     QEventLoop loop;
-    QTimer timer;
-    timer.setSingleShot(true);
-
-    QObject::connect(&proc, &QProcess::finished, &loop, &QEventLoop::quit);
-    QObject::connect(&proc, &QProcess::errorOccurred, &loop, &QEventLoop::quit);
-    QObject::connect(&timer, &QTimer::timeout, &loop, [&]() {
-        res.timedOut = true;
-        proc.kill();
+    startCommand(shellCommand, timeoutMs, [&](const SandboxRunResult& r) {
+        out = r;
         loop.quit();
     });
-
-    timer.start(qMax(500, timeoutMs));
-    proc.start(program, programArgs);
     loop.exec();
-    m_activeProcesses.removeAll(&proc);
+    return out;
+}
 
-    appendCapped(res.stdoutText, proc.readAllStandardOutput());
-    appendCapped(res.stderrText, proc.readAllStandardError());
-
-    if (res.truncated) {
-        res.stderrText += QStringLiteral("\n[output truncated: first %1 KiB shown, %2 bytes omitted]")
-                              .arg(QString::number(kMaxOutputBytes / 1024), QString::number(droppedBytes));
+void BwrapSandbox::gitStatusAndDiffAsync(std::function<void(const QString&, const QString&)> done) {
+    if (m_workspacePath.isEmpty() || !QDir(m_workspacePath).exists()) {
+        QTimer::singleShot(0, this, [done]() { done({}, {}); });
+        return;
     }
-
-    if (res.timedOut) {
-        res.exitCode = 124;
-        res.stderrText += QStringLiteral("\n[Sandbox timeout after %1 ms]").arg(QString::number(timeoutMs));
-    } else {
-        res.exitCode = proc.exitStatus() == QProcess::NormalExit ? proc.exitCode() : 1;
-    }
-
-    if (emitUiSignals) {
-        emit commandFinished(res.exitCode, res.combinedOutput());
-    }
-    return res;
+    static const QString kSeparator = QStringLiteral("\x1e--agora-diff--\x1e");
+    const QString g = "git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c diff.external= ";
+    const QString cmd = g + "status --short; printf '\\n" + kSeparator + "\\n'; " +
+                        g + "add -N . >/dev/null 2>&1; " +
+                        g + "diff --no-color --no-ext-diff";
+    startCommand(cmd, 10000, [done](const SandboxRunResult& r) {
+        const qsizetype sep = r.stdoutText.indexOf(kSeparator);
+        if (sep < 0) {
+            done({}, r.stdoutText);
+            return;
+        }
+        done(r.stdoutText.left(sep).trimmed(), r.stdoutText.mid(sep + kSeparator.size()).trimmed());
+    }, {/*applyResourceLimits=*/false, /*emitUiSignals=*/false});
 }
 
 QString BwrapSandbox::gitDiff() {
-    if (m_workspacePath.isEmpty() || !QDir(m_workspacePath).exists()) {
-        return {};
-    }
-    // Run git inside the bwrap sandbox with disabled fsmonitor/hooks/external diff
-    const QString cmd =
-        "git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c diff.external= add -N . >/dev/null 2>&1; "
-        "git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c diff.external= diff --no-color --no-ext-diff";
-    return runInternal(cmd, 5000, /*applyResourceLimits=*/false, /*emitUiSignals=*/false).stdoutText;
-}
-
-QString BwrapSandbox::gitStatusShort() {
-    if (m_workspacePath.isEmpty() || !QDir(m_workspacePath).exists()) {
-        return {};
-    }
-    const QString cmd =
-        "git -c core.fsmonitor=false -c core.hooksPath=/dev/null status --short";
-    return runInternal(cmd, 3000, /*applyResourceLimits=*/false, /*emitUiSignals=*/false).stdoutText;
+    QString out;
+    QEventLoop loop;
+    gitStatusAndDiffAsync([&](const QString&, const QString& diff) {
+        out = diff;
+        loop.quit();
+    });
+    loop.exec();
+    return out;
 }
 
 } // namespace agora

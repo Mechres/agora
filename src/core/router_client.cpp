@@ -2,7 +2,7 @@
 #include "core/tools.h"
 
 #include <QDir>
-#include <QEventLoop>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -60,46 +60,31 @@ QString LlamaRouterClient::extractHttpErrorDetail(QNetworkReply* reply, const QB
     return detail;
 }
 
-bool LlamaRouterClient::sendBlockingRequest(const QString& method,
-                                            const QString& path,
-                                            const QByteArray& body,
-                                            int timeoutMs,
-                                            QByteArray* responseOut,
-                                            QString* errorOut) {
+void LlamaRouterClient::sendRequest(const QString& method,
+                                    const QString& path,
+                                    const QByteArray& body,
+                                    int timeoutMs,
+                                    RequestCallback done) {
     QNetworkRequest req = makeRequest(path, timeoutMs);
-    QNetworkReply* reply = nullptr;
-    if (method == "GET") {
-        reply = m_nam.get(req);
-    } else if (method == "POST") {
-        reply = m_nam.post(req, body);
-    } else {
-        if (errorOut) *errorOut = "Unsupported HTTP method: " + method;
-        return false;
-    }
+    QNetworkReply* reply = (method == "POST") ? m_nam.post(req, body) : m_nam.get(req);
+    m_pendingRequests.append(reply);
 
-    QEventLoop loop;
-    QTimer timer;
-    timer.setSingleShot(true);
-    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    QObject::connect(&timer, &QTimer::timeout, &loop, [&]() {
-        reply->abort();
-        loop.quit();
+    connect(reply, &QNetworkReply::finished, this, [this, reply, done = std::move(done)]() {
+        m_pendingRequests.removeAll(reply);
+        const QByteArray payload = reply->readAll();
+        const bool ok = (reply->error() == QNetworkReply::NoError);
+        const QString err = ok ? QString() : extractHttpErrorDetail(reply, payload);
+        reply->deleteLater();
+        if (done) done(ok, payload, err);
     });
-    timer.start(qMax(500, timeoutMs));
-    loop.exec();
+}
 
-    QByteArray payload;
-    if (reply->isOpen() && reply->isReadable()) {
-        payload = reply->readAll();
+void LlamaRouterClient::abortPendingRequests() {
+    // Each aborted reply still finishes, so callbacks run with ok=false
+    const auto pending = m_pendingRequests;
+    for (const QPointer<QNetworkReply>& reply : pending) {
+        if (reply) reply->abort();
     }
-    if (responseOut) *responseOut = payload;
-
-    const bool ok = (reply->error() == QNetworkReply::NoError);
-    if (!ok && errorOut) {
-        *errorOut = extractHttpErrorDetail(reply, payload);
-    }
-    reply->deleteLater();
-    return ok;
 }
 
 QVector<ModelInfo> LlamaRouterClient::scanLocalGgufModels() const {
@@ -163,120 +148,142 @@ QStringList LlamaRouterClient::planEvictionsForModel(const QVector<ModelInfo>& m
     return toEvict;
 }
 
-QVector<ModelInfo> LlamaRouterClient::fetchModelsBlocking(bool* routerOnlineOut, QString* errorOut) {
-    QVector<ModelInfo> localModels = scanLocalGgufModels();
-    QMap<QString, double> sizeMap;
-    QMap<QString, QString> pathMap;
-    for (const auto& lm : localModels) {
-        sizeMap[lm.id] = lm.sizeGiB;
-        pathMap[lm.id] = lm.path;
-    }
+void LlamaRouterClient::fetchModels(ModelsCallback done) {
+    const QVector<ModelInfo> localModels = scanLocalGgufModels();
 
-    QByteArray payload;
-    QString err;
-    if (!sendBlockingRequest("GET", "/models", {}, 2500, &payload, &err)) {
-        if (errorOut) *errorOut = err;
-        if (routerOnlineOut) *routerOnlineOut = false;
-        emit routerStatusChanged(false, localModels);
-        return localModels;
-    }
-
-    const QJsonDocument doc = QJsonDocument::fromJson(payload);
-    if (!doc.isObject()) {
-        if (errorOut) *errorOut = "Invalid JSON response from /models";
-        if (routerOnlineOut) *routerOnlineOut = false;
-        emit routerStatusChanged(false, localModels);
-        return localModels;
-    }
-
-    QVector<ModelInfo> merged;
-    const QJsonArray dataArr = doc.object()["data"].toArray();
-    for (const auto& v : dataArr) {
-        const QJsonObject o = v.toObject();
-        ModelInfo info;
-        info.id = o["id"].toString();
-        info.path = o["path"].toString(pathMap.value(info.id));
-        const QJsonObject stObj = o["status"].toObject();
-        info.status = stObj["value"].toString("unloaded");
-        info.failed = stObj["failed"].toBool(false);
-        if (sizeMap.contains(info.id)) {
-            info.sizeGiB = sizeMap.value(info.id);
-        } else if (!info.path.isEmpty() && QFileInfo::exists(info.path)) {
-            info.sizeGiB = static_cast<double>(QFileInfo(info.path).size()) / (1024.0 * 1024.0 * 1024.0);
+    sendRequest("GET", "/models", {}, 2500,
+                [this, localModels, done = std::move(done)](bool ok, const QByteArray& payload, const QString& err) {
+        const QJsonDocument doc = QJsonDocument::fromJson(payload);
+        if (!ok || !doc.isObject()) {
+            emit routerStatusChanged(false, localModels);
+            if (done) done(false, localModels, ok ? QStringLiteral("Invalid JSON response from /models") : err);
+            return;
         }
-        merged.append(info);
-    }
 
-    if (merged.isEmpty()) {
-        merged = localModels;
-    }
+        QMap<QString, double> sizeMap;
+        QMap<QString, QString> pathMap;
+        for (const auto& lm : localModels) {
+            sizeMap[lm.id] = lm.sizeGiB;
+            pathMap[lm.id] = lm.path;
+        }
 
-    if (routerOnlineOut) *routerOnlineOut = true;
-    emit routerStatusChanged(true, merged);
-    return merged;
+        QVector<ModelInfo> merged;
+        const QJsonArray dataArr = doc.object()["data"].toArray();
+        for (const auto& v : dataArr) {
+            const QJsonObject o = v.toObject();
+            ModelInfo info;
+            info.id = o["id"].toString();
+            info.path = o["path"].toString(pathMap.value(info.id));
+            const QJsonObject stObj = o["status"].toObject();
+            info.status = stObj["value"].toString("unloaded");
+            info.failed = stObj["failed"].toBool(false);
+            if (sizeMap.contains(info.id)) {
+                info.sizeGiB = sizeMap.value(info.id);
+            } else if (!info.path.isEmpty() && QFileInfo::exists(info.path)) {
+                info.sizeGiB = static_cast<double>(QFileInfo(info.path).size()) / (1024.0 * 1024.0 * 1024.0);
+            }
+            merged.append(info);
+        }
+        if (merged.isEmpty()) {
+            merged = localModels;
+        }
+
+        emit routerStatusChanged(true, merged);
+        if (done) done(true, merged, {});
+    });
 }
 
-bool LlamaRouterClient::unloadModelBlocking(const QString& modelId, QString* errorOut) {
+void LlamaRouterClient::unloadModel(const QString& modelId, std::function<void(bool, const QString&)> done) {
     m_contextLengthCache.remove(modelId); // may come back with different launch args
     QJsonObject body;
     body["model"] = modelId;
-    return sendBlockingRequest(
-        "POST",
-        "/models/unload",
-        QJsonDocument(body).toJson(QJsonDocument::Compact),
-        15000,
-        nullptr,
-        errorOut);
+    sendRequest("POST", "/models/unload", QJsonDocument(body).toJson(QJsonDocument::Compact), 15000,
+                [done = std::move(done)](bool ok, const QByteArray&, const QString& err) {
+                    if (done) done(ok, err);
+                });
 }
 
-bool LlamaRouterClient::loadModelBlocking(const QString& modelId, QString* errorOut) {
+void LlamaRouterClient::loadModel(const QString& modelId, std::function<void(bool, const QString&)> done) {
     QJsonObject body;
     body["model"] = modelId;
-    return sendBlockingRequest(
-        "POST",
-        "/models/load",
-        QJsonDocument(body).toJson(QJsonDocument::Compact),
-        60000,
-        nullptr,
-        errorOut);
+    sendRequest("POST", "/models/load", QJsonDocument(body).toJson(QJsonDocument::Compact), 120000,
+                [done = std::move(done)](bool ok, const QByteArray&, const QString& err) {
+                    if (done) done(ok, err);
+                });
 }
 
-bool LlamaRouterClient::ensureModelReady(const QString& targetModelId, double vramBudgetGiB, QString* statusLogOut) {
-    bool online = false;
-    QString err;
-    const QVector<ModelInfo> models = fetchModelsBlocking(&online, &err);
-    if (!online) {
-        if (statusLogOut) *statusLogOut = QStringLiteral("Router offline at %1 (%2)").arg(m_baseUrl, err);
-        return false;
-    }
+void LlamaRouterClient::ensureModelReady(const QString& targetModelId, double vramBudgetGiB, ReadyCallback done) {
+    struct Chain {
+        QString log;
+        QStringList evictions;
+        bool resident = false;
+        QElapsedTimer clock;
+    };
+    auto chain = std::make_shared<Chain>();
+    chain->clock.start();
 
-    const QStringList evictions = planEvictionsForModel(models, targetModelId, vramBudgetGiB);
-    for (const QString& evictId : evictions) {
+    auto fail = [chain, done](const QString& msg) {
+        chain->log += msg + "\n";
+        done(false, chain->log.trimmed(), chain->clock.elapsed());
+    };
+
+    // Final step: refresh status and learn the context window (both best-effort)
+    auto finishUp = [this, chain, targetModelId, done]() {
+        fetchModels([this, chain, targetModelId, done](bool, const QVector<ModelInfo>&, const QString&) {
+            fetchContextLength(targetModelId, [chain, done](int) {
+                done(true, chain->log.trimmed(), chain->clock.elapsed());
+            });
+        });
+    };
+
+    auto loadIfNeeded = [this, chain, targetModelId, fail, finishUp]() {
+        if (chain->resident) {
+            finishUp();
+            return;
+        }
+        loadModel(targetModelId, [targetModelId, fail, finishUp](bool ok, const QString& err) {
+            if (!ok) {
+                fail(QStringLiteral("Failed to load model %1: %2").arg(targetModelId, err));
+                return;
+            }
+            finishUp();
+        });
+    };
+
+    // Unload evictions one after another; a failed unload is logged but not fatal
+    auto unloadNext = std::make_shared<std::function<void()>>();
+    *unloadNext = [this, chain, targetModelId, vramBudgetGiB, loadIfNeeded, weakNext = std::weak_ptr(unloadNext)]() {
+        if (chain->evictions.isEmpty()) {
+            loadIfNeeded();
+            return;
+        }
+        const QString evictId = chain->evictions.takeFirst();
         const QString msg = QStringLiteral("VRAM Manager: Unloading %1 to fit %2 within %3 GiB budget...")
                                 .arg(evictId, targetModelId, QString::number(vramBudgetGiB, 'f', 1));
         emit vramSwapNotification(msg);
-        if (statusLogOut) *statusLogOut += msg + "\n";
-        unloadModelBlocking(evictId);
-    }
+        chain->log += msg + "\n";
+        // The pending request keeps the chain alive; the weak self-reference avoids a cycle
+        unloadModel(evictId, [chain, evictId, self = weakNext.lock()](bool ok, const QString& err) {
+            if (!ok) chain->log += QStringLiteral("Unload of %1 failed: %2\n").arg(evictId, err);
+            (*self)();
+        });
+    };
 
-    bool alreadyResident = false;
-    for (const auto& m : models) {
-        if (m.id == targetModelId && (m.status == "loaded" || m.status == "sleeping" || m.status == "loading")) {
-            alreadyResident = true;
-            break;
+    fetchModels([this, chain, targetModelId, vramBudgetGiB, fail, unloadNext](
+                    bool online, const QVector<ModelInfo>& models, const QString& err) {
+        if (!online) {
+            fail(QStringLiteral("Router offline at %1 (%2)").arg(m_baseUrl, err));
+            return;
         }
-    }
-
-    if (!alreadyResident) {
-        QString loadErr;
-        if (!loadModelBlocking(targetModelId, &loadErr)) {
-            if (statusLogOut) *statusLogOut += QStringLiteral("Failed to load model %1: %2\n").arg(targetModelId, loadErr);
-            return false;
+        chain->evictions = planEvictionsForModel(models, targetModelId, vramBudgetGiB);
+        for (const auto& m : models) {
+            if (m.id == targetModelId && (m.status == "loaded" || m.status == "sleeping" || m.status == "loading")) {
+                chain->resident = true;
+                break;
+            }
         }
-    }
-
-    fetchModelsBlocking();
-    return true;
+        (*unloadNext)();
+    });
 }
 
 int LlamaRouterClient::parseContextLengthFromProps(const QByteArray& propsJson) {
@@ -285,18 +292,26 @@ int LlamaRouterClient::parseContextLengthFromProps(const QByteArray& propsJson) 
     return nested > 0 ? nested : root["n_ctx"].toInt(0);
 }
 
-int LlamaRouterClient::contextLengthForModel(const QString& modelId) {
+void LlamaRouterClient::fetchContextLength(const QString& modelId, std::function<void(int)> done) {
     if (const auto it = m_contextLengthCache.constFind(modelId); it != m_contextLengthCache.constEnd()) {
-        return it.value();
+        const int cached = it.value();
+        QTimer::singleShot(0, this, [done, cached]() { done(cached); });
+        return;
     }
-    QByteArray payload;
     const QString path = "/props?model=" + QString::fromUtf8(QUrl::toPercentEncoding(modelId));
-    if (!sendBlockingRequest("GET", path, {}, 3000, &payload, nullptr)) {
-        return 0; // not cached: the model may simply not be up yet
-    }
-    const int nCtx = parseContextLengthFromProps(payload);
-    m_contextLengthCache.insert(modelId, nCtx);
-    return nCtx;
+    sendRequest("GET", path, {}, 3000, [this, modelId, done](bool ok, const QByteArray& payload, const QString&) {
+        if (!ok) {
+            done(0); // not cached: the model may simply not be up yet
+            return;
+        }
+        const int nCtx = parseContextLengthFromProps(payload);
+        m_contextLengthCache.insert(modelId, nCtx);
+        done(nCtx);
+    });
+}
+
+int LlamaRouterClient::cachedContextLength(const QString& modelId) const {
+    return m_contextLengthCache.value(modelId, 0);
 }
 
 bool LlamaRouterClient::startRouterScript(QString* errorOut) {
@@ -317,6 +332,7 @@ void LlamaRouterClient::resetStreamState() {
     m_accumContent.clear();
     m_accumReasoning.clear();
     m_partialToolCalls.clear();
+    m_lastStats = {};
     m_abortedByUser = false;
     m_receivedDoneMarker = false;
 }
@@ -359,6 +375,7 @@ void LlamaRouterClient::startChatStream(const QString& modelId,
     payload["messages"] = messages;
     payload["stream"] = true;
     payload["temperature"] = temperature;
+    payload["stream_options"] = QJsonObject{{"include_usage", true}};
     if (!tools.isEmpty()) {
         payload["tools"] = tools;
         payload["tool_choice"] = "auto";
@@ -478,7 +495,25 @@ void LlamaRouterClient::handleSsePayload(const QByteArray& jsonBytes) {
     const QJsonDocument doc = QJsonDocument::fromJson(jsonBytes, &err);
     if (err.error != QJsonParseError::NoError || !doc.isObject()) return;
 
-    const QJsonArray choices = doc.object()["choices"].toArray();
+    // Usage/timings arrive on the final chunk (which may have no choices at all)
+    const QJsonObject root = doc.object();
+    if (root["usage"].isObject() || root["timings"].isObject()) {
+        const QJsonObject usage = root["usage"].toObject();
+        const QJsonObject timings = root["timings"].toObject();
+        // timings.prompt_n excludes the cached prefix, so prefer usage for the total
+        const int promptTotal = usage["prompt_tokens"].toInt(0);
+        m_lastStats.promptTokens = promptTotal > 0
+                                       ? promptTotal
+                                       : timings["prompt_n"].toInt(0) + timings["cache_n"].toInt(0);
+        m_lastStats.completionTokens = usage["completion_tokens"].toInt(timings["predicted_n"].toInt(0));
+        if (!timings.isEmpty()) {
+            m_lastStats.promptMs = timings["prompt_ms"].toDouble();
+            m_lastStats.generationMs = timings["predicted_ms"].toDouble();
+            m_lastStats.tokensPerSecond = timings["predicted_per_second"].toDouble();
+        }
+    }
+
+    const QJsonArray choices = root["choices"].toArray();
     if (choices.isEmpty()) return;
 
     const QJsonObject choice0 = choices[0].toObject();

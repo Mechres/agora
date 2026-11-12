@@ -110,6 +110,40 @@ struct ToolResult {
     }
 };
 
+// Per-reply numbers reported by llama-server (usage/timings) plus our own model-prep time
+struct TurnStats {
+    int promptTokens = 0;
+    int completionTokens = 0;
+    double promptMs = 0.0;
+    double generationMs = 0.0;
+    double tokensPerSecond = 0.0;
+    qint64 modelPrepMs = 0;   // VRAM swap + load before the request
+
+    bool isEmpty() const { return promptTokens == 0 && completionTokens == 0 && modelPrepMs == 0; }
+
+    QJsonObject toJson() const {
+        QJsonObject obj;
+        obj["promptTokens"] = promptTokens;
+        obj["completionTokens"] = completionTokens;
+        obj["promptMs"] = promptMs;
+        obj["generationMs"] = generationMs;
+        obj["tokensPerSecond"] = tokensPerSecond;
+        obj["modelPrepMs"] = modelPrepMs;
+        return obj;
+    }
+
+    static TurnStats fromJson(const QJsonObject& obj) {
+        TurnStats st;
+        st.promptTokens = obj["promptTokens"].toInt();
+        st.completionTokens = obj["completionTokens"].toInt();
+        st.promptMs = obj["promptMs"].toDouble();
+        st.generationMs = obj["generationMs"].toDouble();
+        st.tokensPerSecond = obj["tokensPerSecond"].toDouble();
+        st.modelPrepMs = obj["modelPrepMs"].toInteger();
+        return st;
+    }
+};
+
 struct ChatMessage {
     QString id;
     QString senderId;     // "user", "system", or participant.id
@@ -123,6 +157,11 @@ struct ChatMessage {
     QVector<ToolResult> toolResults;
     QStringList mentions;
     QString timestamp;
+    TurnStats stats;
+    // Workspace checkpoints (git commits under refs/agora/<session>) bracketing the turn
+    // that ended with this message; empty when the turn changed no files
+    QString checkpointCommit;
+    QString checkpointParent;
 
     QJsonObject toJson() const {
         QJsonObject obj;
@@ -135,6 +174,11 @@ struct ChatMessage {
         obj["content"] = content;
         obj["reasoningContent"] = reasoningContent;
         obj["timestamp"] = timestamp;
+        if (!stats.isEmpty()) obj["stats"] = stats.toJson();
+        if (!checkpointCommit.isEmpty()) {
+            obj["checkpointCommit"] = checkpointCommit;
+            obj["checkpointParent"] = checkpointParent;
+        }
 
         QJsonArray tcArr;
         for (const auto& tc : toolCalls) tcArr.append(tc.toJson());
@@ -161,6 +205,9 @@ struct ChatMessage {
         m.content = obj["content"].toString();
         m.reasoningContent = obj["reasoningContent"].toString();
         m.timestamp = obj["timestamp"].toString();
+        m.stats = TurnStats::fromJson(obj["stats"].toObject());
+        m.checkpointCommit = obj["checkpointCommit"].toString();
+        m.checkpointParent = obj["checkpointParent"].toString();
 
         for (const auto& v : obj["toolCalls"].toArray()) {
             m.toolCalls.append(ToolCall::fromJson(v.toObject()));

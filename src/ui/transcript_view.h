@@ -26,11 +26,18 @@ public:
     void onMessageAdded(int index, const ChatMessage& message, const QVector<ChatMessage>& allMessages);
     void onMessageUpdated(int index, const ChatMessage& message, const QVector<ChatMessage>& allMessages);
 
+    // Model output rendered as GitHub-flavoured Markdown with raw HTML disabled;
+    // returns an HTML fragment. Exposed for tests.
+    static QString markdownToHtmlFragment(const QString& markdown);
+    static QString formatStats(const TurnStats& stats);
+
 signals:
     void sendUserMessageRequested(const QString& text, bool autoStartDebate);
+    void viewTurnChangesRequested(int messageIndex);
+    void undoTurnRequested(int messageIndex);
 
 private:
-    static QString formatMessageHtml(const ChatMessage& msg, bool isLatestTurn);
+    static QString formatMessageHtml(const ChatMessage& msg, int index, bool isLatestTurn);
     void scheduleFlush();
     void flushHtmlToBrowser();
 

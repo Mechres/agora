@@ -11,6 +11,7 @@
 #include <QPointer>
 #include <QString>
 #include <QVector>
+#include <functional>
 
 namespace agora {
 
@@ -43,14 +44,22 @@ public:
                                              const QString& targetModelId,
                                              double vramBudgetGiB);
 
+    using ModelsCallback = std::function<void(bool online, const QVector<ModelInfo>& models, const QString& error)>;
+    using ReadyCallback = std::function<void(bool ok, const QString& log, qint64 elapsedMs)>;
+
     QVector<ModelInfo> scanLocalGgufModels() const;
-    QVector<ModelInfo> fetchModelsBlocking(bool* routerOnlineOut = nullptr, QString* errorOut = nullptr);
-    bool unloadModelBlocking(const QString& modelId, QString* errorOut = nullptr);
-    bool loadModelBlocking(const QString& modelId, QString* errorOut = nullptr);
-    bool ensureModelReady(const QString& targetModelId, double vramBudgetGiB, QString* statusLogOut = nullptr);
-    // Context window (tokens) of a loaded model via GET /props?model=..., cached per model.
-    // Returns 0 when the router does not report it.
-    int contextLengthForModel(const QString& modelId);
+    // All network calls are asynchronous; callbacks run on the event loop
+    void fetchModels(ModelsCallback done = {});
+    void unloadModel(const QString& modelId, std::function<void(bool ok, const QString& error)> done = {});
+    void loadModel(const QString& modelId, std::function<void(bool ok, const QString& error)> done = {});
+    // Evicts models over the VRAM budget, loads the target, then learns its context window
+    void ensureModelReady(const QString& targetModelId, double vramBudgetGiB, ReadyCallback done);
+    // Aborts model-management requests (not the chat stream); their callbacks get ok=false
+    void abortPendingRequests();
+
+    // Context window (tokens) via GET /props?model=..., cached per model; 0 when unknown
+    void fetchContextLength(const QString& modelId, std::function<void(int contextTokens)> done);
+    int cachedContextLength(const QString& modelId) const;
     static int parseContextLengthFromProps(const QByteArray& propsJson);
 
     bool startRouterScript(QString* errorOut = nullptr);
@@ -69,6 +78,8 @@ public:
     QString accumulatedReasoning() const { return m_accumReasoning; }
     QVector<ToolCall> finalizedToolCalls() const;
     bool receivedDoneMarker() const { return m_receivedDoneMarker; }
+    // Token counts and timings of the last completed stream (empty if the server sent none)
+    TurnStats lastStreamStats() const { return m_lastStats; }
 
 signals:
     void routerStatusChanged(bool online, const QVector<ModelInfo>& models);
@@ -88,12 +99,12 @@ private:
     };
 
     QNetworkRequest makeRequest(const QString& path, int transferTimeoutMs = 30000) const;
-    bool sendBlockingRequest(const QString& method,
-                             const QString& path,
-                             const QByteArray& body,
-                             int timeoutMs,
-                             QByteArray* responseOut,
-                             QString* errorOut);
+    using RequestCallback = std::function<void(bool ok, const QByteArray& payload, const QString& error)>;
+    void sendRequest(const QString& method,
+                     const QString& path,
+                     const QByteArray& body,
+                     int timeoutMs,
+                     RequestCallback done);
     static QString extractHttpErrorDetail(QNetworkReply* reply, const QByteArray& responseBody);
     void processSseBuffer(bool flushAll = false);
     void handleSsePayload(const QByteArray& jsonBytes);
@@ -105,6 +116,7 @@ private:
     int m_streamIdleTimeoutMs = 600000;
     QHash<QString, int> m_contextLengthCache;
     QNetworkAccessManager m_nam;
+    QList<QPointer<QNetworkReply>> m_pendingRequests;
 
     QPointer<QNetworkReply> m_activeReply;
     QByteArray m_sseBuffer;
@@ -114,6 +126,7 @@ private:
     QMap<int, PartialToolCall> m_partialToolCalls;
     bool m_abortedByUser = false;
     bool m_receivedDoneMarker = false;
+    TurnStats m_lastStats;
 };
 
 } // namespace agora

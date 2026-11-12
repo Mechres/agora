@@ -25,6 +25,8 @@ add_library(agora_core STATIC
     src/core/storage.cpp
     src/core/sandbox.h
     src/core/sandbox.cpp
+    src/core/checkpoints.h
+    src/core/checkpoints.cpp
     src/core/tools.h
     src/core/tools.cpp
     src/core/router_client.h
@@ -43,8 +45,7 @@ target_link_libraries(agora_core PUBLIC
 
 target_compile_options(agora_core PRIVATE ${AGORA_WARN_FLAGS} ${AGORA_SANITIZER_FLAGS})
 
-add_executable(agora
-    src/main.cpp
+add_library(agora_ui STATIC
     src/ui/main_window.h
     src/ui/main_window.cpp
     src/ui/transcript_view.h
@@ -52,26 +53,33 @@ add_executable(agora
     src/ui/workspace_pane.h
     src/ui/workspace_pane.cpp
 )
-
-target_link_libraries(agora PRIVATE
+target_link_libraries(agora_ui PUBLIC
     agora_core
-    Qt6::Core
     Qt6::Gui
     Qt6::Widgets
     ${AGORA_SANITIZER_FLAGS}
 )
+target_compile_options(agora_ui PRIVATE ${AGORA_WARN_FLAGS} ${AGORA_SANITIZER_FLAGS})
 
+add_executable(agora src/main.cpp)
+target_link_libraries(agora PRIVATE agora_ui ${AGORA_SANITIZER_FLAGS})
 target_compile_options(agora PRIVATE ${AGORA_WARN_FLAGS} ${AGORA_SANITIZER_FLAGS})
 
 enable_testing()
-add_executable(agora_tests
-    tests/test_core.cpp
-)
-target_link_libraries(agora_tests PRIVATE
-    agora_core
-    Qt6::Core
-    Qt6::Test
-    ${AGORA_SANITIZER_FLAGS}
-)
+
+add_executable(agora_tests tests/test_core.cpp)
+target_link_libraries(agora_tests PRIVATE agora_core Qt6::Test ${AGORA_SANITIZER_FLAGS})
 target_compile_options(agora_tests PRIVATE ${AGORA_WARN_FLAGS} ${AGORA_SANITIZER_FLAGS})
 add_test(NAME agora_core_tests COMMAND agora_tests)
+
+# Async flow, checkpoints and an end-to-end debate against a fake llama-server
+add_executable(agora_flow_tests tests/test_flow.cpp tests/fake_llama_server.h)
+target_link_libraries(agora_flow_tests PRIVATE agora_core Qt6::Test ${AGORA_SANITIZER_FLAGS})
+target_compile_options(agora_flow_tests PRIVATE ${AGORA_WARN_FLAGS} ${AGORA_SANITIZER_FLAGS})
+add_test(NAME agora_flow_tests COMMAND agora_flow_tests)
+
+add_executable(agora_ui_tests tests/test_ui.cpp)
+target_link_libraries(agora_ui_tests PRIVATE agora_ui Qt6::Test ${AGORA_SANITIZER_FLAGS})
+target_compile_options(agora_ui_tests PRIVATE ${AGORA_WARN_FLAGS} ${AGORA_SANITIZER_FLAGS})
+add_test(NAME agora_ui_tests COMMAND agora_ui_tests)
+set_tests_properties(agora_ui_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

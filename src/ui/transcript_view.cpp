@@ -1,8 +1,11 @@
 #include "ui/transcript_view.h"
 
+#include <QDesktopServices>
 #include <QHBoxLayout>
 #include <QRegularExpression>
 #include <QScrollBar>
+#include <QTextDocument>
+#include <QUrl>
 #include <QVBoxLayout>
 
 namespace agora {
@@ -26,6 +29,18 @@ TranscriptView::TranscriptView(QWidget* parent) : QWidget(parent) {
 
     m_browser = new QTextBrowser(this);
     m_browser->setOpenExternalLinks(false);
+    m_browser->setOpenLinks(false);
+    connect(m_browser, &QTextBrowser::anchorClicked, this, [this](const QUrl& url) {
+        if (url.scheme() == "agora") {
+            bool ok = false;
+            const int index = url.path().mid(1).toInt(&ok);
+            if (!ok) return;
+            if (url.host() == "diff") emit viewTurnChangesRequested(index);
+            if (url.host() == "undo") emit undoTurnRequested(index);
+        } else if (url.scheme() == "http" || url.scheme() == "https") {
+            QDesktopServices::openUrl(url);
+        }
+    });
 
     QScrollBar* vScroll = m_browser->verticalScrollBar();
     connect(vScroll, &QScrollBar::valueChanged, this, [this, vScroll](int val) {
@@ -110,7 +125,58 @@ void TranscriptView::setMentionParticipants(const QVector<Participant>& particip
     layout->addStretch();
 }
 
-QString TranscriptView::formatMessageHtml(const ChatMessage& msg, bool isLatestTurn) {
+QString TranscriptView::markdownToHtmlFragment(const QString& markdown) {
+    QTextDocument doc;
+    doc.setMarkdown(markdown, QTextDocument::MarkdownFeatures(QTextDocument::MarkdownDialectGitHub |
+                                                              QTextDocument::MarkdownNoHTML));
+    QString html = doc.toHtml();
+    const qsizetype bodyTag = html.indexOf(QStringLiteral("<body"));
+    const qsizetype bodyStart = bodyTag < 0 ? -1 : html.indexOf('>', bodyTag);
+    const qsizetype bodyEnd = html.lastIndexOf(QStringLiteral("</body>"));
+    if (bodyStart >= 0 && bodyEnd > bodyStart) {
+        html = html.mid(bodyStart + 1, bodyEnd - bodyStart - 1);
+    }
+    // Model-written links may only point to the web, never at app actions (agora://),
+    // local files or other schemes
+    static const QRegularExpression unsafeHref(QStringLiteral("href=\"(?!https?://)[^\"]*\""),
+                                               QRegularExpression::CaseInsensitiveOption);
+    html.replace(unsafeHref, QStringLiteral("href=\"#blocked\""));
+    html.replace(QStringLiteral("<pre style=\""),
+                 QStringLiteral("<pre style=\"background-color:#0b1324; color:#e2e8f0; "));
+
+    // Highlight @mentions in text runs only, never inside tags/attributes
+    static const QRegularExpression tagRe(QStringLiteral("(<[^>]*>)"));
+    static const QRegularExpression mentionRe(QStringLiteral("(^|[^A-Za-z0-9_.])(@[A-Za-z0-9_\\-]+)"));
+    QString out;
+    qsizetype pos = 0;
+    auto it = tagRe.globalMatch(html);
+    auto highlight = [](QString text) {
+        return text.replace(mentionRe, QStringLiteral("\\1<b style='color: #38bdf8;'>\\2</b>"));
+    };
+    while (it.hasNext()) {
+        const auto m = it.next();
+        out += highlight(html.mid(pos, m.capturedStart() - pos));
+        out += m.captured(0);
+        pos = m.capturedEnd();
+    }
+    out += highlight(html.mid(pos));
+    return out;
+}
+
+QString TranscriptView::formatStats(const TurnStats& st) {
+    QStringList parts;
+    auto tokens = [](int n) {
+        return n >= 1000 ? QString::number(n / 1000.0, 'f', 1) + "k" : QString::number(n);
+    };
+    if (st.promptTokens > 0) parts << tokens(st.promptTokens) + " prompt tok";
+    if (st.completionTokens > 0) parts << tokens(st.completionTokens) + " tok";
+    if (st.tokensPerSecond > 0) parts << QString::number(st.tokensPerSecond, 'f', 1) + " tok/s";
+    if (st.promptMs > 0) parts << "prefill " + QString::number(st.promptMs / 1000.0, 'f', 1) + "s";
+    if (st.modelPrepMs >= 100) parts << "model prep " + QString::number(st.modelPrepMs / 1000.0, 'f', 1) + "s";
+    return parts.join(QStringLiteral(" · "));
+}
+
+QString TranscriptView::formatMessageHtml(const ChatMessage& msg, int index, bool isLatestTurn) {
     const QString borderColor = msg.colorHex.isEmpty() ? QStringLiteral("#60a5fa") : msg.colorHex;
     QString html = QStringLiteral("<div style='border-left: 4px solid %1; background-color: #162032; "
                                   "padding: 8px 12px; margin-bottom: 10px; border-radius: 6px;'>")
@@ -131,6 +197,12 @@ QString TranscriptView::formatMessageHtml(const ChatMessage& msg, bool isLatestT
     html += QStringLiteral("<span style='color: #64748b; font-size: 11px; float: right;'>%1</span></div>")
                 .arg(msg.timestamp.toHtmlEscaped());
 
+    const QString stats = formatStats(msg.stats);
+    if (!stats.isEmpty()) {
+        html += QStringLiteral("<div style='color: #64748b; font-size: 11px; margin-bottom: 4px;'>⏱ %1</div>")
+                    .arg(stats.toHtmlEscaped());
+    }
+
     const QString trimmedReasoning = msg.reasoningContent.trimmed();
     if (!trimmedReasoning.isEmpty()) {
         QString displayReasoning = trimmedReasoning;
@@ -144,11 +216,8 @@ QString TranscriptView::formatMessageHtml(const ChatMessage& msg, bool isLatestT
     }
 
     if (!msg.content.isEmpty()) {
-        QString formatted = msg.content.toHtmlEscaped();
-        static const QRegularExpression mentionRe(R"((@[A-Za-z0-9_\-]+))");
-        formatted.replace(mentionRe, "<b style='color: #38bdf8;'>\\1</b>");
-        formatted.replace("\n", "<br>");
-        html += QStringLiteral("<div style='color: #f1f5f9; margin-top: 4px;'>%1</div>").arg(formatted);
+        html += QStringLiteral("<div style='color: #f1f5f9; margin-top: 4px;'>%1</div>")
+                    .arg(markdownToHtmlFragment(msg.content));
     }
 
     for (int i = 0; i < msg.toolCalls.size(); ++i) {
@@ -172,6 +241,14 @@ QString TranscriptView::formatMessageHtml(const ChatMessage& msg, bool isLatestT
         html += "</div>";
     }
 
+    if (!msg.checkpointCommit.isEmpty()) {
+        html += QStringLiteral("<div style='margin-top: 6px; font-size: 11px; color: #64748b;'>"
+                               "📌 checkpoint %1 · "
+                               "<a style='color: #93c5fd;' href='agora://diff/%2'>View changes</a> · "
+                               "<a style='color: #fca5a5;' href='agora://undo/%2'>Undo this turn</a></div>")
+                    .arg(msg.checkpointCommit.left(8).toHtmlEscaped(), QString::number(index));
+    }
+
     html += "</div>";
     return html;
 }
@@ -179,7 +256,7 @@ QString TranscriptView::formatMessageHtml(const ChatMessage& msg, bool isLatestT
 void TranscriptView::setMessages(const QVector<ChatMessage>& messages) {
     m_cachedBlocks.resize(messages.size());
     for (int i = 0; i < messages.size(); ++i) {
-        m_cachedBlocks[i] = formatMessageHtml(messages[i], i == messages.size() - 1);
+        m_cachedBlocks[i] = formatMessageHtml(messages[i], i, i == messages.size() - 1);
     }
     m_stickToBottom = true;
     flushHtmlToBrowser();
@@ -193,9 +270,9 @@ void TranscriptView::onMessageAdded(int index, const ChatMessage& message, const
     // Re-format previous last message so its reasoning can be compactly collapsed
     if (!m_cachedBlocks.isEmpty() && allMessages.size() >= 2) {
         const int prevIdx = m_cachedBlocks.size() - 1;
-        m_cachedBlocks[prevIdx] = formatMessageHtml(allMessages[prevIdx], false);
+        m_cachedBlocks[prevIdx] = formatMessageHtml(allMessages[prevIdx], prevIdx, false);
     }
-    m_cachedBlocks.append(formatMessageHtml(message, true));
+    m_cachedBlocks.append(formatMessageHtml(message, index, true));
     m_stickToBottom = true;
     flushHtmlToBrowser();
 }
@@ -206,7 +283,7 @@ void TranscriptView::onMessageUpdated(int index, const ChatMessage& message, con
         return;
     }
     // Only re-render the single modified message block!
-    m_cachedBlocks[index] = formatMessageHtml(message, index == allMessages.size() - 1);
+    m_cachedBlocks[index] = formatMessageHtml(message, index, index == allMessages.size() - 1);
     scheduleFlush();
 }
 

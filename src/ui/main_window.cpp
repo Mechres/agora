@@ -10,6 +10,9 @@
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPlainTextEdit>
@@ -40,10 +43,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     m_sandbox->ensureWorkspaceInitialized();
 
     m_toolEngine = new ToolEngine(m_sandbox, this);
+    m_checkpoints = new CheckpointStore(m_sandbox, this);
     m_router = new LlamaRouterClient(this);
+    m_orchestrator = new Orchestrator(m_router, m_toolEngine, this);
+    m_orchestrator->setCheckpointStore(m_checkpoints);
     loadAppSettings();
 
-    m_orchestrator = new Orchestrator(m_router, m_toolEngine, this);
     m_orchestrator->session().workspacePath = defaultWs;
 
     m_fsWatcher = new QFileSystemWatcher(this);
@@ -106,6 +111,25 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         m_transcriptPane->setStatusText("Error: " + err);
         statusBar()->showMessage("Error: " + err, 8000);
     });
+    connect(m_orchestrator, &Orchestrator::toolApprovalRequested, this, &MainWindow::showToolApprovalDialog);
+    connect(m_orchestrator, &Orchestrator::toolApprovalCancelled, this, [this](quint64 requestId) {
+        if (QPointer<QDialog> dlg = m_approvalDialogs.take(requestId)) dlg->close();
+    });
+    connect(m_orchestrator, &Orchestrator::workspaceChanged, this, [this]() {
+        m_workspacePane->refreshViews();
+    });
+    connect(m_transcriptPane, &TranscriptView::viewTurnChangesRequested, this, &MainWindow::showTurnDiff);
+    connect(m_transcriptPane, &TranscriptView::undoTurnRequested, this, [this](int messageIndex) {
+        if (messageIndex < 0 || messageIndex >= m_orchestrator->session().messages.size()) return;
+        const ChatMessage& msg = m_orchestrator->session().messages[messageIndex];
+        const auto answer = QMessageBox::question(
+            this, "Undo Turn",
+            QStringLiteral("Restore the workspace to its state before %1's turn?\n\n"
+                           "Files changed since then are reverted and files added since then are removed. "
+                           "The current state is saved as a checkpoint first, so this can be undone.")
+                .arg(msg.senderHandle));
+        if (answer == QMessageBox::Yes) m_orchestrator->restoreCheckpointBefore(messageIndex);
+    });
     connect(m_orchestrator, &Orchestrator::activeSpeakerChanged, this,
             [this](const QString&, const QString&, const QString&) {
                 refreshParticipantsList();
@@ -125,6 +149,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                 }
             });
 
+    // Pick default models from local GGUFs right away; the router refresh is asynchronous
+    m_availableModels = m_router->scanLocalGgufModels();
     onRefreshModels();
     populateDefaultCouncil();
     refreshSessionsList();
@@ -145,6 +171,11 @@ void MainWindow::loadAppSettings() {
     limits.memoryMaxMiB = settings.value("sandbox/memoryMaxMiB", limits.memoryMaxMiB).toInt();
     limits.tasksMax = settings.value("sandbox/tasksMax", limits.tasksMax).toInt();
     m_sandbox->setLimits(limits);
+
+    m_orchestrator->setMaxToolDepth(settings.value("orchestrator/maxToolDepth", m_orchestrator->maxToolDepth()).toInt());
+    m_orchestrator->setAutoCheckpoints(settings.value("orchestrator/autoCheckpoints", true).toBool());
+    m_orchestrator->setToolApprovalPolicy(static_cast<ToolApprovalPolicy>(
+        settings.value("orchestrator/approvalPolicy", static_cast<int>(ToolApprovalPolicy::Off)).toInt()));
 }
 
 void MainWindow::saveAppSettings() {
@@ -156,6 +187,9 @@ void MainWindow::saveAppSettings() {
     settings.setValue("router/streamIdleTimeoutSec", m_router->streamIdleTimeoutMs() / 1000);
     settings.setValue("sandbox/memoryMaxMiB", m_sandbox->limits().memoryMaxMiB);
     settings.setValue("sandbox/tasksMax", m_sandbox->limits().tasksMax);
+    settings.setValue("orchestrator/maxToolDepth", m_orchestrator->maxToolDepth());
+    settings.setValue("orchestrator/autoCheckpoints", m_orchestrator->autoCheckpoints());
+    settings.setValue("orchestrator/approvalPolicy", static_cast<int>(m_orchestrator->toolApprovalPolicy()));
 }
 
 void MainWindow::setupUi() {
@@ -359,7 +393,7 @@ void MainWindow::applyDarkTheme() {
 }
 
 void MainWindow::onRefreshModels() {
-    m_router->fetchModelsBlocking();
+    m_router->fetchModels();
 }
 
 void MainWindow::onStartRouterClicked() {
@@ -375,7 +409,7 @@ void MainWindow::onStartRouterClicked() {
 void MainWindow::onOpenSettingsClicked() {
     QDialog dlg(this);
     dlg.setWindowTitle("Agora Settings");
-    dlg.resize(520, 320);
+    dlg.resize(560, 420);
 
     auto* form = new QFormLayout(&dlg);
     auto* editUrl = new QLineEdit(m_router->baseUrl(), &dlg);
@@ -412,6 +446,23 @@ void MainWindow::onOpenSettingsClicked() {
                                      : "Unavailable: needs a systemd user session (systemd-run --user --scope).");
     form->addRow("Sandbox Process Limit:", spinSandboxTasks);
 
+    auto* comboApproval = new QComboBox(&dlg);
+    comboApproval->addItem("Never ask (run all tools)", static_cast<int>(ToolApprovalPolicy::Off));
+    comboApproval->addItem("Ask before writes & commands", static_cast<int>(ToolApprovalPolicy::AskForWrites));
+    comboApproval->addItem("Ask before every tool call", static_cast<int>(ToolApprovalPolicy::AskForAll));
+    comboApproval->setCurrentIndex(comboApproval->findData(static_cast<int>(m_orchestrator->toolApprovalPolicy())));
+    form->addRow("Tool Approval:", comboApproval);
+
+    auto* spinToolDepth = new QSpinBox(&dlg);
+    spinToolDepth->setRange(1, 100);
+    spinToolDepth->setValue(m_orchestrator->maxToolDepth());
+    spinToolDepth->setToolTip("How many rounds of tool calls a participant may chain in one turn.");
+    form->addRow("Max Tool Rounds per Turn:", spinToolDepth);
+
+    auto* chkCheckpoints = new QCheckBox("Snapshot the workspace after every turn (per-turn diff & undo)", &dlg);
+    chkCheckpoints->setChecked(m_orchestrator->autoCheckpoints());
+    form->addRow("Checkpoints:", chkCheckpoints);
+
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -428,6 +479,9 @@ void MainWindow::onOpenSettingsClicked() {
     limits.memoryMaxMiB = spinSandboxMem->value();
     limits.tasksMax = spinSandboxTasks->value();
     m_sandbox->setLimits(limits);
+    m_orchestrator->setToolApprovalPolicy(static_cast<ToolApprovalPolicy>(comboApproval->currentData().toInt()));
+    m_orchestrator->setMaxToolDepth(spinToolDepth->value());
+    m_orchestrator->setAutoCheckpoints(chkCheckpoints->isChecked());
     saveAppSettings();
     onRefreshModels();
 }
@@ -781,6 +835,98 @@ void MainWindow::onBrowseWorkspaceClicked() {
     m_workspacePane->setWorkspacePath(dir);
     m_fsWatcher->addPath(dir);
     m_workspacePane->refreshViews();
+}
+
+void MainWindow::showToolApprovalDialog(quint64 requestId, const QString& speakerHandle, const ToolCall& call) {
+    // Non-modal: the debate's callbacks keep flowing while the dialog is open
+    auto* dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle("Tool Approval");
+    dlg->resize(640, 420);
+
+    auto* layout = new QVBoxLayout(dlg);
+    auto* header = new QLabel(QStringLiteral("<b>%1</b> wants to run <b>%2</b>:")
+                                  .arg(speakerHandle.toHtmlEscaped(), call.name.toHtmlEscaped()), dlg);
+    layout->addWidget(header);
+
+    QString details;
+    const QJsonObject args = QJsonDocument::fromJson(call.argumentsJson.toUtf8()).object();
+    if (call.name == "run_command") {
+        details = "$ " + args["command"].toString();
+    } else if (call.name == "write_file") {
+        details = "File: " + args["path"].toString() + "\n\n" + args["content"].toString().left(20000);
+    } else if (call.name == "patch_file") {
+        details = "File: " + args["path"].toString() + "\n\n--- search\n" + args["search"].toString() +
+                  "\n+++ replace\n" + args["replace"].toString();
+    } else {
+        details = QString::fromUtf8(QJsonDocument(args).toJson(QJsonDocument::Indented));
+    }
+    auto* preview = new QPlainTextEdit(details, dlg);
+    preview->setReadOnly(true);
+    preview->setFont(QFont("Monospace", 10));
+    layout->addWidget(preview, 1);
+
+    auto* reason = new QLineEdit(dlg);
+    reason->setPlaceholderText("Optional note for the model if you deny (e.g. \"use patch_file instead\")");
+    layout->addWidget(reason);
+
+    auto* row = new QHBoxLayout();
+    auto* btnDeny = new QPushButton("Deny", dlg);
+    auto* btnSession = new QPushButton(QStringLiteral("Allow %1 for this session").arg(call.name), dlg);
+    auto* btnOnce = new QPushButton("Allow once", dlg);
+    btnOnce->setDefault(true);
+    row->addWidget(btnDeny);
+    row->addStretch();
+    row->addWidget(btnSession);
+    row->addWidget(btnOnce);
+    layout->addLayout(row);
+
+    auto resolve = [this, requestId, dlg, reason](ToolApprovalDecision decision) {
+        m_approvalDialogs.remove(requestId);
+        const QString note = reason->text();
+        dlg->disconnect(this); // don't treat the close below as a denial
+        dlg->close();
+        m_orchestrator->resolveToolApproval(requestId, decision, note);
+    };
+    connect(btnOnce, &QPushButton::clicked, dlg, [resolve]() { resolve(ToolApprovalDecision::AllowOnce); });
+    connect(btnSession, &QPushButton::clicked, dlg, [resolve]() { resolve(ToolApprovalDecision::AllowToolForSession); });
+    connect(btnDeny, &QPushButton::clicked, dlg, [resolve]() { resolve(ToolApprovalDecision::Deny); });
+    // Closing the window counts as a denial (no-op if the orchestrator already cancelled it)
+    connect(dlg, &QDialog::finished, this, [this, requestId, reason]() {
+        m_approvalDialogs.remove(requestId);
+        m_orchestrator->resolveToolApproval(requestId, ToolApprovalDecision::Deny, reason->text());
+    });
+
+    m_approvalDialogs.insert(requestId, dlg);
+    dlg->show();
+    dlg->raise();
+    dlg->activateWindow();
+}
+
+void MainWindow::showTurnDiff(int messageIndex) {
+    if (messageIndex < 0 || messageIndex >= m_orchestrator->session().messages.size()) return;
+    const ChatMessage msg = m_orchestrator->session().messages[messageIndex];
+    if (msg.checkpointCommit.isEmpty()) return;
+
+    m_checkpoints->diff(msg.checkpointParent, msg.checkpointCommit,
+                        [this, handle = msg.senderHandle, time = msg.timestamp](bool ok, const QString& text) {
+        if (!ok) {
+            statusBar()->showMessage("Could not load turn diff: " + text, 8000);
+            return;
+        }
+        auto* dlg = new QDialog(this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->setWindowTitle(QStringLiteral("Changes made in %1's turn (%2)").arg(handle, time));
+        dlg->resize(900, 640);
+        auto* layout = new QVBoxLayout(dlg);
+        auto* view = new QPlainTextEdit(text.isEmpty() ? QStringLiteral("(no file changes)") : text, dlg);
+        view->setReadOnly(true);
+        view->setFont(QFont("Monospace", 10));
+        view->setLineWrapMode(QPlainTextEdit::NoWrap);
+        new CodeDiffHighlighter(view->document(), /*diffMode=*/true);
+        layout->addWidget(view);
+        dlg->show();
+    });
 }
 
 } // namespace agora

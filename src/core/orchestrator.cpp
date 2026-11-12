@@ -15,7 +15,7 @@ Orchestrator::Orchestrator(LlamaRouterClient* router, ToolEngine* toolEngine, QO
     m_session.title = "New Agora Debate";
 
     QObject::connect(m_router, &LlamaRouterClient::streamReasoningDelta, this, [this](const QString& delta) {
-        if (m_activeMessageIndex >= 0 && m_activeMessageIndex < m_session.messages.size()) {
+        if (m_running && m_activeMessageIndex >= 0 && m_activeMessageIndex < m_session.messages.size()) {
             ChatMessage& msg = m_session.messages[m_activeMessageIndex];
             msg.reasoningContent += delta;
             emit messageUpdated(m_activeMessageIndex, msg);
@@ -23,7 +23,7 @@ Orchestrator::Orchestrator(LlamaRouterClient* router, ToolEngine* toolEngine, QO
     });
 
     QObject::connect(m_router, &LlamaRouterClient::streamContentDelta, this, [this](const QString& delta) {
-        if (m_activeMessageIndex >= 0 && m_activeMessageIndex < m_session.messages.size()) {
+        if (m_running && m_activeMessageIndex >= 0 && m_activeMessageIndex < m_session.messages.size()) {
             ChatMessage& msg = m_session.messages[m_activeMessageIndex];
             msg.content += delta;
             emit messageUpdated(m_activeMessageIndex, msg);
@@ -31,30 +31,24 @@ Orchestrator::Orchestrator(LlamaRouterClient* router, ToolEngine* toolEngine, QO
     });
 
     QObject::connect(m_router, &LlamaRouterClient::streamFinished, this, &Orchestrator::onModelStreamFinished);
-
-    QObject::connect(m_router, &LlamaRouterClient::streamError, this, [this](const QString& err) {
-        m_running = false;
-        m_activeSpeakerId.clear();
-        emit activeSpeakerChanged({}, {}, {});
-        emit debateStateChanged(false, m_completedTurns, m_session.maxRounds);
-        emit errorNotification("Model stream error: " + err);
-    });
+    QObject::connect(m_router, &LlamaRouterClient::streamError, this, &Orchestrator::onModelStreamError);
 }
 
 void Orchestrator::setSession(const RoomSession& s) {
-    ++m_generationId;
-    m_router->abortActiveStream();
-    if (m_toolEngine && m_toolEngine->sandbox()) {
-        m_toolEngine->sandbox()->cancelRunningCommand();
-    }
+    abortInFlight();
     m_running = false;
     m_activeSpeakerId.clear();
     m_activeMessageIndex = -1;
     m_session = s;
     m_completedTurns = 0;
     m_roundRobinCursor = 0;
+    m_sessionApprovedTools.clear();
     emit activeSpeakerChanged({}, {}, {});
     emit debateStateChanged(false, m_completedTurns, m_session.maxRounds);
+}
+
+double Orchestrator::charsPerTokenFor(const QString& modelId) const {
+    return m_charsPerToken.value(modelId, kDefaultCharsPerToken);
 }
 
 QStringList Orchestrator::extractMentions(const QString& text,
@@ -158,11 +152,31 @@ std::optional<Participant> Orchestrator::selectNextSpeaker(const QVector<Partici
     return chosen;
 }
 
-int Orchestrator::contextCharBudget(int contextTokens) {
+int Orchestrator::contextCharBudget(int contextTokens, double charsPerToken) {
     if (contextTokens <= 0) return kDefaultMaxContextChars;
-    // ~3 chars per token for code-heavy text; leave a quarter of the window for the tool
-    // schema and the reply.
-    return qMax(8000, contextTokens / 4 * 9);
+    // The ratio is measured on message text only, so tool schema and chat-template
+    // overhead are already priced in; keep a quarter of the window for the reply.
+    const double cpt = qBound(1.0, charsPerToken, 8.0);
+    return qMax(8000, static_cast<int>(contextTokens * 0.75 * cpt));
+}
+
+bool Orchestrator::declaresDone(const QString& content) {
+    return content.contains(QStringLiteral("[DONE]"));
+}
+
+bool Orchestrator::needsApproval(ToolApprovalPolicy policy,
+                                 const QString& toolName,
+                                 const QSet<QString>& approvedForSession) {
+    if (policy == ToolApprovalPolicy::Off || approvedForSession.contains(toolName)) return false;
+    if (policy == ToolApprovalPolicy::AskForWrites) return !ToolEngine::isReadOnlyTool(toolName);
+    return true;
+}
+
+bool Orchestrator::isContextOverflowError(const QString& errorText) {
+    const QString e = errorText.toLower();
+    return e.contains("exceed_context_size") ||
+           (e.contains("context") && (e.contains("exceed") || e.contains("too long") ||
+                                      e.contains("maximum context length")));
 }
 
 QJsonArray Orchestrator::buildMessagesForSpeaker(const Participant& speaker,
@@ -186,7 +200,9 @@ QJsonArray Orchestrator::buildMessagesForSpeaker(const Participant& speaker,
         "1. You share an isolated workspace mounted at `/workspace`.\n"
         "2. You have tools: `list_files`, `read_file`, `write_file`, `patch_file`, `run_command` (runs inside Bubblewrap sandbox), and `git_diff`.\n"
         "3. To pass the floor or ask another participant a question, mention their `@handle` at the end of your response (e.g. `-> @coder` or `@reviewer`).\n"
-        "4. Do not impersonate other participants; speak only as %1.\n")
+        "4. Do not impersonate other participants; speak only as %1.\n"
+        "5. When the user's task is fully complete and verified in the sandbox, end your message with "
+        "`[DONE]` to close the session. Never write it otherwise.\n")
         .arg(speaker.handle,
              speaker.displayName,
              speaker.systemPrompt,
@@ -294,12 +310,16 @@ QJsonArray Orchestrator::buildMessagesForSpeaker(const Participant& speaker,
             }
             break;
         }
+        // Keep a contiguous run of recent turns: once one doesn't fit, everything older
+        // (except the pinned task) is dropped, so the model never sees a gap mid-history
+        bool full = false;
         for (int i = validHistory.size() - 1; i >= 0; --i) {
             if (keep[i]) continue;
-            if (used + turnSizes[i] <= budget || i == validHistory.size() - 1) {
+            if (!full && (used + turnSizes[i] <= budget || i == validHistory.size() - 1)) {
                 keep[i] = true;
                 used += turnSizes[i];
             } else {
+                full = true;
                 droppedCount++;
             }
         }
@@ -383,50 +403,47 @@ void Orchestrator::stepSingleTurn() {
 }
 
 void Orchestrator::stopDebate() {
-    ++m_generationId;
-    m_router->abortActiveStream();
-    if (m_toolEngine && m_toolEngine->sandbox()) {
-        m_toolEngine->sandbox()->cancelRunningCommand();
-    }
+    abortInFlight();
     if (m_running) {
-        m_running = false;
-        m_activeSpeakerId.clear();
-        m_activeMessageIndex = -1;
-        emit activeSpeakerChanged({}, {}, {});
-        emit debateStateChanged(false, m_completedTurns, m_session.maxRounds);
-        emit statusNotification("Debate paused/stopped.");
+        endRun(QStringLiteral("Debate paused/stopped."));
     }
 }
 
-void Orchestrator::scheduleNextTurn() {
-    if (!m_running) return;
-
-    const int limit = m_singleStepMode ? 1 : m_session.maxRounds;
-    if (m_completedTurns >= limit) {
-        m_running = false;
-        m_activeSpeakerId.clear();
-        emit activeSpeakerChanged({}, {}, {});
-        emit debateStateChanged(false, m_completedTurns, m_session.maxRounds);
-        emit statusNotification("Completed target number of turns.");
-        return;
+void Orchestrator::abortInFlight() {
+    ++m_generationId;
+    m_router->abortActiveStream();
+    m_router->abortPendingRequests();
+    if (m_toolEngine && m_toolEngine->sandbox()) {
+        m_toolEngine->sandbox()->cancelRunningCommand();
     }
+    cancelPendingApproval();
+}
 
-    auto nextOpt = selectNextSpeaker(
-        m_session.participants, m_session.messages, m_session.mode, &m_roundRobinCursor);
-    if (!nextOpt) {
-        m_running = false;
-        m_activeSpeakerId.clear();
-        emit activeSpeakerChanged({}, {}, {});
-        emit debateStateChanged(false, m_completedTurns, m_session.maxRounds);
-        emit statusNotification("No eligible next speaker found.");
-        return;
+void Orchestrator::endRun(const QString& message, bool isError) {
+    m_running = false;
+    m_activeSpeakerId.clear();
+    m_activeMessageIndex = -1;
+    emit activeSpeakerChanged({}, {}, {});
+    emit debateStateChanged(false, m_completedTurns, m_session.maxRounds);
+    if (isError) {
+        emit errorNotification(message);
+    } else {
+        emit statusNotification(message);
     }
+}
 
-    const Participant speaker = *nextOpt;
-    m_activeSpeakerId = speaker.id;
-    emit activeSpeakerChanged(speaker.id, speaker.handle, speaker.modelId);
-    emit statusNotification(QStringLiteral("Preparing %1 (%2)...").arg(speaker.handle, speaker.modelId));
+void Orchestrator::dropEmptyPlaceholder() {
+    if (m_activeMessageIndex >= 0 && m_activeMessageIndex == m_session.messages.size() - 1) {
+        const ChatMessage& msg = m_session.messages[m_activeMessageIndex];
+        if (msg.content.isEmpty() && msg.reasoningContent.isEmpty() && msg.toolCalls.isEmpty()) {
+            m_session.messages.removeLast();
+            m_activeMessageIndex = -1;
+            emit messageUpdated(-1, {}); // forces a full transcript refresh
+        }
+    }
+}
 
+int Orchestrator::appendPendingMessage(const Participant& speaker) {
     ChatMessage msg;
     msg.id = "pending_" + QUuid::createUuid().toString(QUuid::Id128).left(8);
     msg.senderId = speaker.id;
@@ -435,53 +452,116 @@ void Orchestrator::scheduleNextTurn() {
     msg.modelId = speaker.modelId;
     msg.colorHex = speaker.colorHex;
     msg.timestamp = QDateTime::currentDateTime().toString("HH:mm:ss");
-
     m_session.messages.append(msg);
     m_activeMessageIndex = m_session.messages.size() - 1;
     emit messageAdded(m_activeMessageIndex, msg);
-
-    launchSpeakerTurn(speaker, m_activeMessageIndex, 0);
+    return m_activeMessageIndex;
 }
 
-void Orchestrator::launchSpeakerTurn(const Participant& speaker, int messageIndex, int toolDepth) {
+void Orchestrator::scheduleNextTurn() {
     if (!m_running) return;
+
+    const int limit = m_singleStepMode ? 1 : m_session.maxRounds;
+    if (m_completedTurns >= limit) {
+        endRun(QStringLiteral("Completed target number of turns."));
+        return;
+    }
+
+    auto nextOpt = selectNextSpeaker(
+        m_session.participants, m_session.messages, m_session.mode, &m_roundRobinCursor);
+    if (!nextOpt) {
+        endRun(QStringLiteral("No eligible next speaker found."));
+        return;
+    }
+    beginTurn(*nextOpt);
+}
+
+void Orchestrator::beginTurn(const Participant& speaker) {
     const quint64 genId = m_generationId;
+    m_turnSpeaker = speaker;
+    m_turnBaseCommit.clear();
+    m_turnPrepMs = 0;
+    m_budgetOverride = 0;
+    m_contextRetryUsed = false;
+    m_activeSpeakerId = speaker.id;
+    emit activeSpeakerChanged(speaker.id, speaker.handle, speaker.modelId);
+    appendPendingMessage(speaker);
+
+    auto prepareModel = [this, genId, speaker]() {
+        if (!alive(genId)) return;
+        emit statusNotification(QStringLiteral("Preparing %1 (%2)...").arg(speaker.handle, speaker.modelId));
+        m_router->ensureModelReady(speaker.modelId, m_session.vramBudgetGiB,
+                                   [this, genId](bool ok, const QString& log, qint64 elapsedMs) {
+            if (!alive(genId)) return;
+            if (!ok) {
+                dropEmptyPlaceholder();
+                endRun(log.isEmpty() ? QStringLiteral("Router/model preparation failed.") : log, true);
+                return;
+            }
+            m_turnPrepMs = elapsedMs;
+            startStream(0);
+        });
+    };
+
+    // Snapshot first so manual edits since the last turn aren't attributed to this speaker
+    if (m_autoCheckpoints && m_checkpoints) {
+        m_checkpoints->snapshot(m_session.id, "before " + speaker.handle + " turn",
+                                [this, genId, prepareModel](const Checkpoint& cp) {
+            if (!alive(genId)) return;
+            if (cp.ok) m_turnBaseCommit = cp.commit;
+            prepareModel();
+        });
+    } else {
+        prepareModel();
+    }
+}
+
+void Orchestrator::startStream(int toolDepth) {
     m_currentToolDepth = toolDepth;
-    m_activeMessageIndex = messageIndex;
-
-    QString swapLog;
-    const bool ready = m_router->ensureModelReady(speaker.modelId, m_session.vramBudgetGiB, &swapLog);
-
-    if (!m_running || genId != m_generationId ||
-        m_activeMessageIndex < 0 || m_activeMessageIndex >= m_session.messages.size()) {
-        return;
-    }
-
-    if (!ready) {
-        // Remove the empty pending message placeholder when model preparation fails
-        if (m_activeMessageIndex >= 0 && m_activeMessageIndex < m_session.messages.size() &&
-            m_session.messages[m_activeMessageIndex].content.isEmpty()) {
-            m_session.messages.removeAt(m_activeMessageIndex);
-        }
-        m_running = false;
-        m_activeSpeakerId.clear();
-        m_activeMessageIndex = -1;
-        emit activeSpeakerChanged({}, {}, {});
-        emit debateStateChanged(false, m_completedTurns, m_session.maxRounds);
-        emit errorNotification(swapLog.trimmed().isEmpty() ? QStringLiteral("Router/model preparation failed.") : swapLog.trimmed());
-        return;
-    }
-
+    const Participant& speaker = m_turnSpeaker;
     emit statusNotification(QStringLiteral("%1 (%2) is speaking...").arg(speaker.handle, speaker.modelId));
 
+    int budget = contextCharBudget(m_router->cachedContextLength(speaker.modelId),
+                                   charsPerTokenFor(speaker.modelId));
+    if (m_budgetOverride > 0) budget = qMin(budget, m_budgetOverride);
+    m_lastBudget = budget;
+
     const QJsonArray messages = buildMessagesForSpeaker(
-        speaker, m_session.participants, m_session.messages, m_session.workspacePath,
-        contextCharBudget(m_router->contextLengthForModel(speaker.modelId)));
-    const QJsonArray tools = (toolDepth < m_maxToolDepth)
-                                 ? ToolEngine::openAiToolsSchema()
-                                 : QJsonArray{};
+        speaker, m_session.participants, m_session.messages, m_session.workspacePath, budget);
+    const QJsonArray tools = (toolDepth < m_maxToolDepth) ? ToolEngine::openAiToolsSchema() : QJsonArray{};
+
+    m_lastSentChars = 0;
+    for (const auto& v : messages) {
+        m_lastSentChars += v.toObject()["content"].toString().size();
+    }
 
     m_router->startChatStream(speaker.modelId, messages, tools, speaker.temperature);
+}
+
+void Orchestrator::onModelStreamError(const QString& error) {
+    if (!m_running || m_activeMessageIndex < 0 || m_activeMessageIndex >= m_session.messages.size()) {
+        return;
+    }
+
+    if (!m_contextRetryUsed && isContextOverflowError(error)) {
+        // Retry once with much less history, and remember the model packs fewer chars per token
+        m_contextRetryUsed = true;
+        m_budgetOverride = static_cast<int>(m_lastBudget * 0.6);
+        const QString model = m_turnSpeaker.modelId;
+        m_charsPerToken[model] = charsPerTokenFor(model) * 0.6;
+
+        ChatMessage& msg = m_session.messages[m_activeMessageIndex];
+        msg.content.clear();
+        msg.reasoningContent.clear();
+        emit messageUpdated(m_activeMessageIndex, msg);
+        emit statusNotification(QStringLiteral("Context window exceeded; retrying %1 with less history...")
+                                    .arg(m_turnSpeaker.handle));
+        startStream(m_currentToolDepth);
+        return;
+    }
+
+    dropEmptyPlaceholder();
+    endRun("Model stream error: " + error, true);
 }
 
 void Orchestrator::onModelStreamFinished(const QString& content,
@@ -493,64 +573,184 @@ void Orchestrator::onModelStreamFinished(const QString& content,
 
     const quint64 genId = m_generationId;
     const int msgIdx = m_activeMessageIndex;
-    const QString speakerId = m_session.messages[msgIdx].senderId;
-    const QString speakerHandle = m_session.messages[msgIdx].senderHandle;
+    ChatMessage& msg = m_session.messages[msgIdx];
+    msg.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    msg.content = content;
+    msg.reasoningContent = reasoning;
+    msg.mentions = extractMentions(content, m_session.participants, /*handoffOnly=*/true);
 
-    m_session.messages[msgIdx].content = content;
-    m_session.messages[msgIdx].reasoningContent = reasoning;
-    m_session.messages[msgIdx].mentions = extractMentions(content, m_session.participants, /*handoffOnly=*/true);
+    msg.stats = m_router->lastStreamStats();
+    msg.stats.modelPrepMs = (m_currentToolDepth == 0) ? m_turnPrepMs : 0;
+    if (msg.stats.promptTokens > 0 && m_lastSentChars > 0) {
+        const QString model = m_turnSpeaker.modelId;
+        const double measured = static_cast<double>(m_lastSentChars) / msg.stats.promptTokens;
+        m_charsPerToken[model] = m_charsPerToken.contains(model)
+                                     ? 0.5 * m_charsPerToken[model] + 0.5 * measured
+                                     : measured;
+    }
+    m_budgetOverride = 0;
+    m_contextRetryUsed = false;
+    emit messageUpdated(msgIdx, msg);
 
     if (!toolCalls.isEmpty() && m_currentToolDepth < m_maxToolDepth) {
-        for (const auto& tc : toolCalls) {
-            if (!m_running || genId != m_generationId || msgIdx >= m_session.messages.size()) {
-                return;
-            }
-            m_session.messages[msgIdx].toolCalls.append(tc);
-            emit statusNotification(QStringLiteral("%1 executing tool `%2`...").arg(speakerHandle, tc.name));
-            const ToolResult res = m_toolEngine->executeToolCall(tc);
-            if (!m_running || genId != m_generationId || msgIdx >= m_session.messages.size()) {
-                return;
-            }
-            m_session.messages[msgIdx].toolResults.append(res);
-            emit messageUpdated(msgIdx, m_session.messages[msgIdx]);
-        }
-
-        for (const auto& p : m_session.participants) {
-            if (p.id == speakerId) {
-                QTimer::singleShot(50, this, [this, p, genId]() {
-                    if (!m_running || genId != m_generationId) return;
-                    ChatMessage followMsg;
-                    followMsg.id = "pending_" + QUuid::createUuid().toString(QUuid::Id128).left(8);
-                    followMsg.senderId = p.id;
-                    followMsg.senderHandle = p.handle;
-                    followMsg.displayName = p.displayName;
-                    followMsg.modelId = p.modelId;
-                    followMsg.colorHex = p.colorHex;
-                    followMsg.timestamp = QDateTime::currentDateTime().toString("HH:mm:ss");
-                    m_session.messages.append(followMsg);
-                    m_activeMessageIndex = m_session.messages.size() - 1;
-                    emit messageAdded(m_activeMessageIndex, followMsg);
-                    launchSpeakerTurn(p, m_activeMessageIndex, m_currentToolDepth + 1);
-                });
-                return;
-            }
-        }
+        runToolCall(msgIdx, toolCalls, 0, genId);
+        return;
     }
+    finalizeTurn(msgIdx, genId);
+}
 
-    if (!m_running || genId != m_generationId || msgIdx >= m_session.messages.size()) {
+void Orchestrator::runToolCall(int messageIndex, const QVector<ToolCall>& calls, int callIndex, quint64 genId) {
+    if (!alive(genId) || messageIndex >= m_session.messages.size()) return;
+
+    if (callIndex >= calls.size()) {
+        // Let the speaker continue after seeing the tool output
+        appendPendingMessage(m_turnSpeaker);
+        startStream(m_currentToolDepth + 1);
         return;
     }
 
-    m_session.messages[msgIdx].id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const ToolCall call = calls[callIndex];
+    const QString handle = m_turnSpeaker.handle;
+
+    auto execute = [this, messageIndex, calls, callIndex, genId, call, handle]() {
+        m_session.messages[messageIndex].toolCalls.append(call);
+        emit messageUpdated(messageIndex, m_session.messages[messageIndex]);
+        emit statusNotification(QStringLiteral("%1 executing tool `%2`...").arg(handle, call.name));
+        m_toolEngine->executeToolCallAsync(call, [this, messageIndex, calls, callIndex, genId](const ToolResult& res) {
+            if (!alive(genId) || messageIndex >= m_session.messages.size()) return;
+            m_session.messages[messageIndex].toolResults.append(res);
+            emit messageUpdated(messageIndex, m_session.messages[messageIndex]);
+            runToolCall(messageIndex, calls, callIndex + 1, genId);
+        });
+    };
+
+    if (!needsApproval(m_approvalPolicy, call.name, m_sessionApprovedTools)) {
+        execute();
+        return;
+    }
+
+    requestApproval(handle, call, [this, messageIndex, calls, callIndex, genId, call, execute](
+                                      ToolApprovalDecision decision, const QString& reason) {
+        if (!alive(genId) || messageIndex >= m_session.messages.size()) return;
+        if (decision == ToolApprovalDecision::Deny) {
+            ChatMessage& msg = m_session.messages[messageIndex];
+            msg.toolCalls.append(call);
+            QString output = QStringLiteral("Denied by the user; the tool was not run.");
+            if (!reason.trimmed().isEmpty()) output += " Reason: " + reason.trimmed();
+            msg.toolResults.append({call.id, call.name, output, true, 1});
+            emit messageUpdated(messageIndex, msg);
+            runToolCall(messageIndex, calls, callIndex + 1, genId);
+            return;
+        }
+        if (decision == ToolApprovalDecision::AllowToolForSession) {
+            m_sessionApprovedTools.insert(call.name);
+        }
+        execute();
+    });
+}
+
+void Orchestrator::finalizeTurn(int messageIndex, quint64 genId) {
     m_session.updatedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
-    emit messageUpdated(msgIdx, m_session.messages[msgIdx]);
+    const QString handle = m_turnSpeaker.handle;
+    const bool done = declaresDone(m_session.messages[messageIndex].content);
 
-    m_completedTurns++;
-    emit debateStateChanged(m_running, m_completedTurns, m_session.maxRounds);
+    auto advance = [this, genId, done, handle]() {
+        if (!alive(genId)) return;
+        m_completedTurns++;
+        emit debateStateChanged(true, m_completedTurns, m_session.maxRounds);
+        if (done) {
+            endRun(QStringLiteral("%1 marked the task complete [DONE].").arg(handle));
+            return;
+        }
+        QTimer::singleShot(150, this, [this, genId]() {
+            if (alive(genId)) scheduleNextTurn();
+        });
+    };
 
-    QTimer::singleShot(150, this, [this, genId]() {
-        if (!m_running || genId != m_generationId) return;
-        scheduleNextTurn();
+    if (!(m_autoCheckpoints && m_checkpoints)) {
+        advance();
+        return;
+    }
+
+    const QString sessionId = m_session.id;
+    const QString base = m_turnBaseCommit;
+    m_checkpoints->snapshot(sessionId, "after " + handle + " turn",
+                            [this, sessionId, base, messageIndex, advance](const Checkpoint& cp) {
+        // Record the checkpoint even if the user pressed Stop meanwhile, but never into
+        // a different session
+        if (cp.ok && cp.changed && m_session.id == sessionId && messageIndex < m_session.messages.size()) {
+            ChatMessage& msg = m_session.messages[messageIndex];
+            msg.checkpointCommit = cp.commit;
+            msg.checkpointParent = base.isEmpty() ? cp.parent : base;
+            emit messageUpdated(messageIndex, msg);
+        }
+        advance();
+    });
+}
+
+void Orchestrator::requestApproval(const QString& speakerHandle, const ToolCall& call,
+                                   std::function<void(ToolApprovalDecision, const QString&)> onDecision) {
+    cancelPendingApproval();
+    m_pendingApprovalId = ++m_nextApprovalId;
+    m_pendingApproval = std::move(onDecision);
+    emit statusNotification(QStringLiteral("Waiting for your approval: %1 wants to run `%2`")
+                                .arg(speakerHandle, call.name));
+    emit toolApprovalRequested(m_pendingApprovalId, speakerHandle, call);
+}
+
+void Orchestrator::resolveToolApproval(quint64 requestId, ToolApprovalDecision decision, const QString& reason) {
+    if (requestId == 0 || requestId != m_pendingApprovalId || !m_pendingApproval) return;
+    auto callback = std::move(m_pendingApproval);
+    m_pendingApproval = nullptr;
+    m_pendingApprovalId = 0;
+    callback(decision, reason);
+}
+
+void Orchestrator::cancelPendingApproval() {
+    if (m_pendingApprovalId == 0) return;
+    const quint64 id = m_pendingApprovalId;
+    m_pendingApprovalId = 0;
+    m_pendingApproval = nullptr;
+    emit toolApprovalCancelled(id);
+}
+
+void Orchestrator::restoreCheckpointBefore(int messageIndex) {
+    if (m_running) {
+        emit errorNotification(QStringLiteral("Stop the debate before restoring a checkpoint."));
+        return;
+    }
+    if (!m_checkpoints || messageIndex < 0 || messageIndex >= m_session.messages.size()) return;
+    const ChatMessage& msg = m_session.messages[messageIndex];
+    if (msg.checkpointParent.isEmpty()) {
+        emit errorNotification(QStringLiteral("This turn has no checkpoint to restore."));
+        return;
+    }
+
+    const QString sessionId = m_session.id;
+    const QString target = msg.checkpointParent;
+    const QString handle = msg.senderHandle;
+    emit statusNotification(QStringLiteral("Restoring workspace to before %1's turn...").arg(handle));
+    m_checkpoints->restore(sessionId, target, [this, sessionId, target, handle](bool ok, const QString& savedOrError) {
+        if (m_session.id != sessionId) return;
+        if (!ok) {
+            emit errorNotification("Restore failed: " + savedOrError);
+            return;
+        }
+        ChatMessage note;
+        note.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        note.senderId = "system";
+        note.senderHandle = "@agora";
+        note.displayName = "Agora";
+        note.colorHex = "#a78bfa";
+        note.timestamp = QDateTime::currentDateTime().toString("HH:mm:ss");
+        note.content = QStringLiteral("Workspace restored to its state before %1's turn (checkpoint %2). "
+                                      "The state just before this restore was saved as checkpoint %3.")
+                           .arg(handle, target.left(10), savedOrError.left(10));
+        m_session.messages.append(note);
+        m_session.updatedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+        emit messageAdded(m_session.messages.size() - 1, note);
+        emit workspaceChanged();
+        emit statusNotification(QStringLiteral("Workspace restored."));
     });
 }
 
