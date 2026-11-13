@@ -589,6 +589,33 @@ void AgoraCoreTest::testVramEvictionPlanner() {
     const QStringList evictFor27B = LlamaRouterClient::planEvictionsForModel(
         models, "Qwen3.8-27B-UD-IQ2_S", 8.5);
     QCOMPARE(evictFor27B.size(), 2);
+
+    // Sleeping models hold no VRAM: they are neither counted nor worth unloading
+    QVector<ModelInfo> withSleeper = {
+        {"A", "", "loaded", 3.0, false},
+        {"Sleepy", "", "sleeping", 5.0, false},
+        {"B", "", "unloaded", 3.0, false},
+    };
+    QVERIFY(LlamaRouterClient::planEvictions(withSleeper, "B", 7.0)->isEmpty());
+    // ...but a sleeping target needs its room back before it wakes
+    QCOMPARE(*LlamaRouterClient::planEvictions(withSleeper, "Sleepy", 7.0), QStringList{"A"});
+
+    // Lookahead: the model needed latest goes first, regardless of size
+    QVector<ModelInfo> three = {
+        {"Big", "", "loaded", 4.0, false},
+        {"Small", "", "loaded", 2.0, false},
+        {"Next", "", "unloaded", 3.0, false},
+    };
+    QCOMPARE(*LlamaRouterClient::planEvictions(three, "Next", 7.0, {"Next", "Big", "Small"}), QStringList{"Small"});
+    QCOMPARE(*LlamaRouterClient::planEvictions(three, "Next", 7.0, {"Next", "Small"}), QStringList{"Big"});
+    // A model never needed again counts as furthest
+    QCOMPARE(*LlamaRouterClient::planEvictions(three, "Next", 7.0, {"Next", "Big"}), QStringList{"Small"});
+
+    // Kept models are never evicted; if nothing else frees enough, there is no plan
+    QCOMPARE(*LlamaRouterClient::planEvictions(three, "Next", 7.0, {}, {"Big"}), QStringList{"Small"});
+    QVERIFY(!LlamaRouterClient::planEvictions(three, "Next", 5.0, {}, {"Big"}).has_value());
+    // Without kept models it is best effort: evict everything
+    QCOMPARE(LlamaRouterClient::planEvictions(three, "Next", 2.0)->size(), 2);
 }
 
 void AgoraCoreTest::testSqliteSessionStore() {

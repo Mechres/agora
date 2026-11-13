@@ -58,6 +58,14 @@ public:
 
     void setTransientRetryDelayMs(int ms) { m_transientRetryDelayMs = qMax(0, ms); }
 
+    // Load the predicted next speaker's model while the current one is speaking
+    void setPreloadNextModel(bool enabled) { m_preloadNextModel = enabled; }
+    bool preloadNextModel() const { return m_preloadNextModel; }
+
+    // Local models of the enabled participants in round-robin order after `speaker`, each once;
+    // used to evict the model needed latest
+    static QStringList upcomingLocalModels(const QVector<Participant>& participants, const Participant& speaker);
+
     void setToolApprovalPolicy(ToolApprovalPolicy policy) { m_approvalPolicy = policy; }
     ToolApprovalPolicy toolApprovalPolicy() const { return m_approvalPolicy; }
 
@@ -116,6 +124,8 @@ signals:
     void toolApprovalRequested(quint64 requestId, const QString& speakerHandle, const ToolCall& call);
     void toolApprovalCancelled(quint64 requestId);
     void workspaceChanged();
+    // Low-priority progress (e.g. background preloading), for a status bar rather than the transcript
+    void backgroundNotification(const QString& text);
 
 private:
     bool alive(quint64 genId) const { return m_running && genId == m_generationId; }
@@ -126,6 +136,7 @@ private:
 
     void scheduleNextTurn();
     void beginTurn(const Participant& speaker);
+    void beginTurnModelPrep(const Participant& speaker, quint64 genId);
     void startStream(int toolDepth);
     void onModelStreamFinished(const QString& content,
                                const QString& reasoning,
@@ -135,6 +146,7 @@ private:
     void runToolCall(int messageIndex, const QVector<ToolCall>& calls, int callIndex, quint64 genId);
     void finalizeTurn(int messageIndex, quint64 genId);
     void appendSystemNote(const QString& text);
+    void preloadPredictedNextSpeaker();
 
     void requestApproval(const QString& speakerHandle, const ToolCall& call,
                          std::function<void(ToolApprovalDecision, const QString&)> onDecision);
@@ -150,6 +162,7 @@ private:
     bool m_autoCheckpoints = true;
     int m_maxToolDepth = kDefaultMaxToolDepth;
     int m_transientRetryDelayMs = kDefaultTransientRetryDelayMs;
+    bool m_preloadNextModel = true;
     ToolApprovalPolicy m_approvalPolicy = ToolApprovalPolicy::Off;
 
     // Run state
@@ -173,6 +186,10 @@ private:
     bool m_transientRetryUsed = false;
 
     QHash<QString, double> m_charsPerToken;
+
+    // Background preload; a turn that starts meanwhile waits for it to settle first
+    bool m_preloadInFlight = false;
+    std::function<void()> m_afterPreload;
     QSet<QString> m_omitTemperature; // model keys whose API rejected our temperature
 
     // Tool approval

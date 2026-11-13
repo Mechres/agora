@@ -35,6 +35,9 @@ Built with zero external C++ dependencies beyond the C++20 standard library and 
 - **VRAM-Aware Router Management**:
   - Integrates with `llama-server` router endpoints (`GET /models`, `POST /models/load`, `POST /models/unload`, `GET /props`).
   - Automatically calculates resident GGUF sizes against a configurable **VRAM Budget** (default `8.5 GiB` for 12 GB GPUs). Lightweight models remain co-resident, while large models (`9B`–`29B`) are swapped in and out on turn transitions.
+  - **Lookahead eviction**: when room is needed, the model whose next turn is furthest away (per the speaking order) is unloaded first. Unloads finish releasing memory before the next model loads, so llama.cpp's auto-fit doesn't push layers onto the CPU.
+  - **Preloading** (Settings → Model Preloading, on by default): while one participant speaks, the next speaker's model is loaded in the background if it fits within the budget alongside the current one; otherwise its GGUF is read into the page cache so the swap skips the disk.
+  - Models put to sleep by `--sleep-idle-seconds` hold no VRAM and aren't counted; a sleeping speaker gets room made for it and is woken before its turn. The "model prep" time in each message's stats includes the full load or wake.
 - **Bubblewrap (`bwrap`) Isolated Shared Workspace**:
   - Every room shares a Git-initialized workspace mounted at `/workspace` inside `bwrap` (`--unshare-all` and `--new-session` by default, read-only host `/usr`, `/bin`, `/lib` and a minimal `/etc`).
   - Git always runs inside the sandbox. Agents can commit, but `.git/config` and `.git/hooks` are read-only, so nothing planted there can run when you use git on the host. An existing repository's config is never modified.
@@ -103,6 +106,7 @@ The end-to-end tests run a complete debate against a small fake `llama-server` (
 | Tool Approval | Never ask | See *Tool Approval* above |
 | Max Tool Rounds per Turn | 8 | How many tool-call rounds one participant may chain |
 | Checkpoints | On | Per-turn snapshots, diffs and undo |
+| Model Preloading | On | Load the next speaker's model during the current turn |
 
 External providers are managed separately under **☁ Providers** (name, base URL, API key or `$ENV_VAR`, context budget).
 

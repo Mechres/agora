@@ -176,6 +176,22 @@ bool Orchestrator::declaresDone(const QString& content) {
     return content.contains(QStringLiteral("[DONE]"));
 }
 
+QStringList Orchestrator::upcomingLocalModels(const QVector<Participant>& participants, const Participant& speaker) {
+    QVector<Participant> enabled;
+    int start = 0;
+    for (const auto& p : participants) {
+        if (!p.enabled) continue;
+        if (p.id == speaker.id) start = enabled.size() + 1;
+        enabled.append(p);
+    }
+    QStringList order;
+    for (int i = 0; i < enabled.size(); ++i) {
+        const Participant& p = enabled[(start + i) % enabled.size()];
+        if (p.providerId.isEmpty() && !p.modelId.isEmpty() && !order.contains(p.modelId)) order << p.modelId;
+    }
+    return order;
+}
+
 QStringList Orchestrator::participantsYetToSpeak(const QVector<Participant>& participants,
                                                  const QVector<ChatMessage>& history) {
     QSet<QString> spoke;
@@ -463,6 +479,7 @@ void Orchestrator::abortInFlight() {
         m_toolEngine->sandbox()->cancelRunningCommand();
     }
     cancelPendingApproval();
+    m_afterPreload = nullptr; // the preload's callback still arrives (aborted) and clears the flag
 }
 
 void Orchestrator::endRun(const QString& message, bool isError) {
@@ -536,29 +553,14 @@ void Orchestrator::beginTurn(const Participant& speaker) {
 
     auto prepareModel = [this, genId, speaker]() {
         if (!alive(genId)) return;
-        if (!speaker.providerId.isEmpty()) {
-            // External APIs host their own models: nothing to load or evict
-            if (!providerFor(speaker)) {
-                dropEmptyPlaceholder();
-                endRun(QStringLiteral("%1 uses an external provider that is no longer configured. "
-                                      "Pick a provider in the participant settings.").arg(speaker.handle), true);
-                return;
-            }
-            startStream(0);
+        if (m_preloadInFlight) {
+            // Let the preload finish its unloads first so the two don't race
+            m_afterPreload = [this, genId, speaker]() {
+                if (alive(genId)) beginTurnModelPrep(speaker, genId);
+            };
             return;
         }
-        emit statusNotification(QStringLiteral("Preparing %1 (%2)...").arg(speaker.handle, speaker.modelId));
-        m_router->ensureModelReady(speaker.modelId, m_session.vramBudgetGiB,
-                                   [this, genId](bool ok, const QString& log, qint64 elapsedMs) {
-            if (!alive(genId)) return;
-            if (!ok) {
-                dropEmptyPlaceholder();
-                endRun(log.isEmpty() ? QStringLiteral("Router/model preparation failed.") : log, true);
-                return;
-            }
-            m_turnPrepMs = elapsedMs;
-            startStream(0);
-        });
+        beginTurnModelPrep(speaker, genId);
     };
 
     // Snapshot first so manual edits since the last turn aren't attributed to this speaker
@@ -572,6 +574,63 @@ void Orchestrator::beginTurn(const Participant& speaker) {
     } else {
         prepareModel();
     }
+}
+
+void Orchestrator::beginTurnModelPrep(const Participant& speaker, quint64 genId) {
+    if (!speaker.providerId.isEmpty()) {
+        // External APIs host their own models: nothing to load or evict
+        if (!providerFor(speaker)) {
+            dropEmptyPlaceholder();
+            endRun(QStringLiteral("%1 uses an external provider that is no longer configured. "
+                                  "Pick a provider in the participant settings.").arg(speaker.handle), true);
+            return;
+        }
+        startStream(0);
+        return;
+    }
+    emit statusNotification(QStringLiteral("Preparing %1 (%2)...").arg(speaker.handle, speaker.modelId));
+    m_router->ensureModelReady(speaker.modelId, m_session.vramBudgetGiB,
+                               [this, genId](bool ok, const QString& log, qint64 elapsedMs) {
+        if (!alive(genId)) return;
+        if (!ok) {
+            dropEmptyPlaceholder();
+            endRun(log.isEmpty() ? QStringLiteral("Router/model preparation failed.") : log, true);
+            return;
+        }
+        m_turnPrepMs = elapsedMs;
+        startStream(0);
+    }, upcomingLocalModels(m_session.participants, speaker));
+}
+
+void Orchestrator::preloadPredictedNextSpeaker() {
+    const Participant& current = m_turnSpeaker;
+    const int limit = m_singleStepMode ? 1 : m_session.maxRounds;
+    if (!m_preloadNextModel || m_preloadInFlight || m_completedTurns + 1 >= limit) return;
+
+    // Assume the current speaker hands off round-robin; an @mention may still pick someone else
+    int cursor = m_roundRobinCursor;
+    QVector<ChatMessage> hypothetical = m_session.messages;
+    if (hypothetical.isEmpty() || hypothetical.last().senderId != current.id) {
+        ChatMessage placeholder;
+        placeholder.senderId = current.id;
+        hypothetical.append(placeholder);
+    }
+    hypothetical.last().content.clear();
+    hypothetical.last().mentions.clear();
+    const auto next = selectNextSpeaker(m_session.participants, hypothetical, m_session.mode, &cursor);
+    if (!next || !next->providerId.isEmpty() || next->modelId == current.modelId) return;
+
+    const quint64 genId = m_generationId;
+    const QSet<QString> keep = current.providerId.isEmpty() ? QSet<QString>{current.modelId} : QSet<QString>{};
+    m_preloadInFlight = true;
+    m_router->prefetchModel(next->modelId, m_session.vramBudgetGiB, upcomingLocalModels(m_session.participants, current),
+                            keep, [this, genId, handle = next->handle, model = next->modelId](const QString& outcome) {
+        m_preloadInFlight = false;
+        if (genId == m_generationId) {
+            emit backgroundNotification(QStringLiteral("Preloading %1 for %2: %3").arg(model, handle, outcome));
+        }
+        if (auto cont = std::exchange(m_afterPreload, nullptr)) cont();
+    });
 }
 
 void Orchestrator::startStream(int toolDepth) {
@@ -600,6 +659,7 @@ void Orchestrator::startStream(int toolDepth) {
         endpoint = ChatEndpoint{provider->baseUrl, provider->resolvedApiKey(), m_omitTemperature.contains(key)};
     }
     m_router->startChatStream(speaker.modelId, messages, tools, speaker.temperature, endpoint);
+    if (toolDepth == 0) preloadPredictedNextSpeaker();
 }
 
 void Orchestrator::clearPartialReply() {

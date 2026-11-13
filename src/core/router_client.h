@@ -9,6 +9,7 @@
 #include <QNetworkReply>
 #include <QObject>
 #include <QPointer>
+#include <QSet>
 #include <QString>
 #include <QVector>
 #include <functional>
@@ -48,9 +49,24 @@ public:
     void setStreamIdleTimeoutMs(int ms) { m_streamIdleTimeoutMs = qMax(10000, ms); }
     int streamIdleTimeoutMs() const { return m_streamIdleTimeoutMs; }
 
+    // Only loaded/loading models hold VRAM; a sleeping one has freed its weights and KV cache
+    static bool occupiesVram(const QString& status) { return status == "loaded" || status == "loading"; }
+
+    // Models to unload so the target fits the budget. Models whose next use comes soonest in
+    // `upcoming` are evicted last (largest first among equals); models in `keep` never are.
+    // nullopt when the target can't fit without evicting a kept model.
+    static std::optional<QStringList> planEvictions(const QVector<ModelInfo>& models,
+                                                    const QString& targetModelId,
+                                                    double vramBudgetGiB,
+                                                    const QStringList& upcoming = {},
+                                                    const QSet<QString>& keep = {});
     static QStringList planEvictionsForModel(const QVector<ModelInfo>& models,
                                              const QString& targetModelId,
                                              double vramBudgetGiB);
+
+    // Waiting for a model to finish loading (the router's /models/load returns immediately)
+    void setModelLoadTimeoutMs(int ms) { m_modelLoadTimeoutMs = qMax(1000, ms); }
+    void setStatusPollIntervalMs(int ms) { m_statusPollIntervalMs = qMax(10, ms); }
 
     using ModelsCallback = std::function<void(bool online, const QVector<ModelInfo>& models, const QString& error)>;
     using ReadyCallback = std::function<void(bool ok, const QString& log, qint64 elapsedMs)>;
@@ -60,8 +76,17 @@ public:
     void fetchModels(ModelsCallback done = {});
     void unloadModel(const QString& modelId, std::function<void(bool ok, const QString& error)> done = {});
     void loadModel(const QString& modelId, std::function<void(bool ok, const QString& error)> done = {});
-    // Evicts models over the VRAM budget, loads the target, then learns its context window
-    void ensureModelReady(const QString& targetModelId, double vramBudgetGiB, ReadyCallback done);
+    // Evicts models over the VRAM budget (those needed latest per `upcoming` first), loads or wakes
+    // the target and waits until it is up, then learns its context window
+    void ensureModelReady(const QString& targetModelId, double vramBudgetGiB, ReadyCallback done,
+                          const QStringList& upcoming = {});
+    // Starts loading a model ahead of its turn without disturbing the models in `keep`. When it
+    // can't fit next to them, its file is read into the page cache instead so the later load
+    // skips the disk. `done` reports what was done, once the load has been started.
+    void prefetchModel(const QString& targetModelId, double vramBudgetGiB, const QStringList& upcoming,
+                       const QSet<QString>& keep, std::function<void(const QString& outcome)> done);
+    // Asynchronous readahead of a file into the page cache (skipped when RAM is short)
+    static void warmFileCache(const QString& path);
     // Aborts model-management requests (not the chat stream); their callbacks get ok=false
     void abortPendingRequests();
 
@@ -126,6 +151,14 @@ private:
                      RequestCallback done);
     void sendRequest(const QString& method, const QNetworkRequest& req, const QByteArray& body, RequestCallback done);
     static QString extractHttpErrorDetail(QNetworkReply* reply, const QByteArray& responseBody);
+    // Polls /models until `ready` holds (ok=true) or the timeout passes or requests are aborted
+    void waitForModels(std::function<bool(const QVector<ModelInfo>&)> ready, int timeoutMs,
+                       std::function<void(bool ok, const QVector<ModelInfo>& models)> done);
+    // Unloads each model, then waits until they have actually released their memory
+    void unloadAndWait(const QStringList& modelIds, std::function<void(const QString& log)> done);
+    void loadAndWait(const QString& modelId, std::function<void(bool ok, const QString& error)> done);
+    // A sleeping model only wakes on a real request; a one-token completion does it
+    void wakeModel(const QString& modelId, std::function<void(bool ok, const QString& error)> done);
     void processSseBuffer(bool flushAll = false);
     void handleSsePayload(const QByteArray& jsonBytes);
 
@@ -134,6 +167,9 @@ private:
     QString m_modelsDir;
     QString m_routerScriptPath;
     int m_streamIdleTimeoutMs = 600000;
+    int m_modelLoadTimeoutMs = 300000;
+    int m_statusPollIntervalMs = 250;
+    quint64 m_abortGeneration = 0; // bumped by abortPendingRequests to stop status polling
     QHash<QString, int> m_contextLengthCache;
     QNetworkAccessManager m_nam;
     QList<QPointer<QNetworkReply>> m_pendingRequests;

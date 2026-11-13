@@ -140,6 +140,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         m_transcriptPane->setStatusText("Error: " + err);
         statusBar()->showMessage("Error: " + err, 8000);
     });
+    connect(m_orchestrator, &Orchestrator::backgroundNotification, this, [this](const QString& text) {
+        statusBar()->showMessage(text, 8000);
+    });
     connect(m_orchestrator, &Orchestrator::toolApprovalRequested, this, &MainWindow::showToolApprovalDialog);
     connect(m_orchestrator, &Orchestrator::toolApprovalCancelled, this, [this](quint64 requestId) {
         if (QPointer<QDialog> dlg = m_approvalDialogs.take(requestId)) dlg->close();
@@ -209,6 +212,7 @@ void MainWindow::loadAppSettings() {
 
     m_orchestrator->setMaxToolDepth(settings.value("orchestrator/maxToolDepth", m_orchestrator->maxToolDepth()).toInt());
     m_orchestrator->setAutoCheckpoints(settings.value("orchestrator/autoCheckpoints", true).toBool());
+    m_orchestrator->setPreloadNextModel(settings.value("orchestrator/preloadNextModel", true).toBool());
     m_orchestrator->setToolApprovalPolicy(static_cast<ToolApprovalPolicy>(
         settings.value("orchestrator/approvalPolicy", static_cast<int>(ToolApprovalPolicy::Off)).toInt()));
 
@@ -229,6 +233,7 @@ void MainWindow::saveAppSettings() {
     settings.setValue("sandbox/tasksMax", m_sandbox->limits().tasksMax);
     settings.setValue("orchestrator/maxToolDepth", m_orchestrator->maxToolDepth());
     settings.setValue("orchestrator/autoCheckpoints", m_orchestrator->autoCheckpoints());
+    settings.setValue("orchestrator/preloadNextModel", m_orchestrator->preloadNextModel());
     settings.setValue("orchestrator/approvalPolicy", static_cast<int>(m_orchestrator->toolApprovalPolicy()));
 
     const RoomSession& room = m_orchestrator->session();
@@ -850,6 +855,12 @@ void MainWindow::onOpenSettingsClicked() {
     chkCheckpoints->setChecked(m_orchestrator->autoCheckpoints());
     form->addRow("Checkpoints:", chkCheckpoints);
 
+    auto* chkPreload = new QCheckBox("Load the next speaker's model while the current one is speaking", &dlg);
+    chkPreload->setChecked(m_orchestrator->preloadNextModel());
+    chkPreload->setToolTip("Loads it into VRAM when it fits within the VRAM budget next to the current model; "
+                           "otherwise reads its file into RAM so the swap skips the disk.");
+    form->addRow("Model Preloading:", chkPreload);
+
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -869,6 +880,7 @@ void MainWindow::onOpenSettingsClicked() {
     m_orchestrator->setToolApprovalPolicy(static_cast<ToolApprovalPolicy>(comboApproval->currentData().toInt()));
     m_orchestrator->setMaxToolDepth(spinToolDepth->value());
     m_orchestrator->setAutoCheckpoints(chkCheckpoints->isChecked());
+    m_orchestrator->setPreloadNextModel(chkPreload->isChecked());
     saveAppSettings();
     onRefreshModels();
 }

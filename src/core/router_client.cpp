@@ -11,6 +11,10 @@
 #include <QUrl>
 #include <QUuid>
 #include <algorithm>
+#include <climits>
+#include <fcntl.h>
+#include <thread>
+#include <unistd.h>
 
 namespace agora {
 
@@ -97,6 +101,7 @@ void LlamaRouterClient::sendRequest(const QString& method,
 }
 
 void LlamaRouterClient::abortPendingRequests() {
+    ++m_abortGeneration;
     // Each aborted reply still finishes, so callbacks run with ok=false
     const auto pending = m_pendingRequests;
     for (const QPointer<QNetworkReply>& reply : pending) {
@@ -121,48 +126,59 @@ QVector<ModelInfo> LlamaRouterClient::scanLocalGgufModels() const {
     return list;
 }
 
-QStringList LlamaRouterClient::planEvictionsForModel(const QVector<ModelInfo>& models,
-                                                     const QString& targetModelId,
-                                                     double vramBudgetGiB) {
-    auto isResident = [](const QString& st) {
-        return st == "loaded" || st == "sleeping" || st == "loading";
-    };
+std::optional<QStringList> LlamaRouterClient::planEvictions(const QVector<ModelInfo>& models,
+                                                           const QString& targetModelId,
+                                                           double vramBudgetGiB,
+                                                           const QStringList& upcoming,
+                                                           const QSet<QString>& keep) {
+    auto sizeOf = [](const ModelInfo& m) { return m.sizeGiB > 0.01 ? m.sizeGiB : 2.0; };
 
     double targetSize = 2.0;
     for (const auto& m : models) {
         if (m.id == targetModelId) {
-            if (isResident(m.status)) {
-                return {};
-            }
-            if (m.sizeGiB > 0.01) targetSize = m.sizeGiB;
+            if (occupiesVram(m.status)) return QStringList{};
+            targetSize = sizeOf(m);
             break;
         }
     }
 
-    QVector<ModelInfo> residents;
+    QVector<ModelInfo> candidates;
     double residentSum = 0.0;
     for (const auto& m : models) {
-        if (m.id != targetModelId && isResident(m.status)) {
-            residents.append(m);
-            residentSum += (m.sizeGiB > 0.01 ? m.sizeGiB : 2.0);
-        }
+        if (m.id == targetModelId || !occupiesVram(m.status)) continue;
+        residentSum += sizeOf(m);
+        if (!keep.contains(m.id)) candidates.append(m);
     }
+    if (residentSum + targetSize <= vramBudgetGiB) return QStringList{};
 
-    if (residents.isEmpty() || (residentSum + targetSize <= vramBudgetGiB)) {
-        return {};
-    }
-
-    std::sort(residents.begin(), residents.end(), [](const ModelInfo& a, const ModelInfo& b) {
+    // Furthest next use first (never-again counts as furthest), then largest
+    auto nextUse = [&upcoming](const QString& id) {
+        const qsizetype idx = upcoming.indexOf(id);
+        return idx < 0 ? INT_MAX : static_cast<int>(idx);
+    };
+    std::sort(candidates.begin(), candidates.end(), [&](const ModelInfo& a, const ModelInfo& b) {
+        const int ua = nextUse(a.id);
+        const int ub = nextUse(b.id);
+        if (ua != ub) return ua > ub;
         return a.sizeGiB > b.sizeGiB;
     });
 
     QStringList toEvict;
-    for (const auto& r : residents) {
+    for (const auto& c : candidates) {
         if (residentSum + targetSize <= vramBudgetGiB) break;
-        toEvict.append(r.id);
-        residentSum -= (r.sizeGiB > 0.01 ? r.sizeGiB : 2.0);
+        toEvict.append(c.id);
+        residentSum -= sizeOf(c);
     }
-    return toEvict;
+    if (residentSum + targetSize > vramBudgetGiB && !keep.isEmpty()) {
+        return std::nullopt; // only evicting a kept model would make room
+    }
+    return toEvict; // with nothing kept, evicting everything is the best we can do
+}
+
+QStringList LlamaRouterClient::planEvictionsForModel(const QVector<ModelInfo>& models,
+                                                     const QString& targetModelId,
+                                                     double vramBudgetGiB) {
+    return planEvictions(models, targetModelId, vramBudgetGiB).value_or(QStringList{});
 }
 
 void LlamaRouterClient::fetchModels(ModelsCallback done) {
@@ -194,8 +210,11 @@ void LlamaRouterClient::fetchModels(ModelsCallback done) {
             const QJsonObject stObj = o["status"].toObject();
             info.status = stObj["value"].toString("unloaded");
             info.failed = stObj["failed"].toBool(false);
+            const double metaBytes = o["meta"].toObject()["size"].toDouble(0);
             if (sizeMap.contains(info.id)) {
                 info.sizeGiB = sizeMap.value(info.id);
+            } else if (metaBytes > 0) {
+                info.sizeGiB = metaBytes / (1024.0 * 1024.0 * 1024.0);
             } else if (!info.path.isEmpty() && QFileInfo::exists(info.path)) {
                 info.sizeGiB = static_cast<double>(QFileInfo(info.path).size()) / (1024.0 * 1024.0 * 1024.0);
             }
@@ -229,11 +248,134 @@ void LlamaRouterClient::loadModel(const QString& modelId, std::function<void(boo
                 });
 }
 
-void LlamaRouterClient::ensureModelReady(const QString& targetModelId, double vramBudgetGiB, ReadyCallback done) {
+void LlamaRouterClient::waitForModels(std::function<bool(const QVector<ModelInfo>&)> ready, int timeoutMs,
+                                      std::function<void(bool, const QVector<ModelInfo>&)> done) {
+    struct Wait {
+        QElapsedTimer clock;
+        quint64 generation = 0;
+    };
+    auto wait = std::make_shared<Wait>();
+    wait->clock.start();
+    wait->generation = m_abortGeneration;
+
+    auto poll = std::make_shared<std::function<void()>>();
+    *poll = [this, wait, timeoutMs, ready, done, weakPoll = std::weak_ptr(poll)]() {
+        // The pending request, then the timer, hold the only strong reference; the function
+        // itself keeps a weak one to avoid a cycle
+        fetchModels([this, wait, timeoutMs, ready, done, self = weakPoll.lock()](
+                        bool online, const QVector<ModelInfo>& models, const QString&) {
+            if (wait->generation != m_abortGeneration) {
+                done(false, models); // aborted
+                return;
+            }
+            if (online && ready(models)) {
+                done(true, models);
+                return;
+            }
+            if (wait->clock.elapsed() >= timeoutMs) {
+                done(false, models);
+                return;
+            }
+            QTimer::singleShot(m_statusPollIntervalMs, this, [self]() { (*self)(); });
+        });
+    };
+    (*poll)();
+}
+
+void LlamaRouterClient::unloadAndWait(const QStringList& modelIds, std::function<void(const QString&)> done) {
+    if (modelIds.isEmpty()) {
+        QTimer::singleShot(0, this, [done]() { done({}); });
+        return;
+    }
+    auto log = std::make_shared<QString>();
+    auto remaining = std::make_shared<int>(modelIds.size());
+    for (const QString& id : modelIds) {
+        unloadModel(id, [this, id, log, remaining, modelIds, done](bool ok, const QString& err) {
+            if (!ok) *log += QStringLiteral("Unload of %1 failed: %2\n").arg(id, err);
+            if (--*remaining > 0) return;
+            // Unloading only asks the process to exit; loading the next model while the old one
+            // still holds VRAM would make llama.cpp's auto-fit push layers onto the CPU
+            waitForModels([modelIds](const QVector<ModelInfo>& models) {
+                for (const auto& m : models) {
+                    if (modelIds.contains(m.id) && occupiesVram(m.status)) return false;
+                }
+                return true;
+            }, 30000, [log, done](bool ok, const QVector<ModelInfo>&) {
+                if (!ok) *log += QStringLiteral("Evicted models were still releasing memory after 30 s.\n");
+                done(*log);
+            });
+        });
+    }
+}
+
+void LlamaRouterClient::loadAndWait(const QString& modelId, std::function<void(bool, const QString&)> done) {
+    loadModel(modelId, [this, modelId, done](bool ok, const QString& err) {
+        // "already running" means someone else (e.g. a preload) started it; just wait
+        if (!ok && !err.contains("already running")) {
+            done(false, err);
+            return;
+        }
+        waitForModels([modelId](const QVector<ModelInfo>& models) {
+            for (const auto& m : models) {
+                if (m.id == modelId) return m.status != "loading";
+            }
+            return true;
+        }, m_modelLoadTimeoutMs, [this, modelId, done](bool ok, const QVector<ModelInfo>& models) {
+            if (!ok) {
+                done(false, QStringLiteral("not ready after %1 s").arg(m_modelLoadTimeoutMs / 1000));
+                return;
+            }
+            for (const auto& m : models) {
+                if (m.id != modelId) continue;
+                if (m.status == "loaded" || m.status == "sleeping") {
+                    done(true, {});
+                } else {
+                    done(false, m.failed ? QStringLiteral("the model process failed to start (see the router log)")
+                                         : QStringLiteral("status is '%1'").arg(m.status));
+                }
+                return;
+            }
+            done(true, {});
+        });
+    });
+}
+
+void LlamaRouterClient::wakeModel(const QString& modelId, std::function<void(bool, const QString&)> done) {
+    QJsonObject body;
+    body["model"] = modelId;
+    body["prompt"] = "ok";
+    body["max_tokens"] = 1;
+    sendRequest("POST", "/v1/completions", QJsonDocument(body).toJson(QJsonDocument::Compact), m_modelLoadTimeoutMs,
+                [done](bool ok, const QByteArray&, const QString& err) { done(ok, err); });
+}
+
+void LlamaRouterClient::warmFileCache(const QString& path) {
+    if (path.isEmpty()) return;
+    const qint64 size = QFileInfo(path).size();
+    if (size <= 0) return;
+    // Don't push other programs' data out of RAM for a file that wouldn't stay cached anyway
+    QFile meminfo("/proc/meminfo");
+    if (meminfo.open(QIODevice::ReadOnly)) {
+        for (const QByteArray& line : meminfo.readAll().split('\n')) {
+            if (!line.startsWith("MemAvailable:")) continue;
+            const qint64 availableBytes = line.mid(13).trimmed().split(' ').value(0).toLongLong() * 1024;
+            if (availableBytes < size * 2) return;
+        }
+    }
+    const QByteArray nativePath = QFile::encodeName(path);
+    // posix_fadvise(WILLNEED) reads synchronously in large chunks, so keep it off the GUI thread
+    std::thread([nativePath]() {
+        const int fd = ::open(nativePath.constData(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return;
+        ::posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+        ::close(fd);
+    }).detach();
+}
+
+void LlamaRouterClient::ensureModelReady(const QString& targetModelId, double vramBudgetGiB, ReadyCallback done,
+                                         const QStringList& upcoming) {
     struct Chain {
         QString log;
-        QStringList evictions;
-        bool resident = false;
         QElapsedTimer clock;
     };
     auto chain = std::make_shared<Chain>();
@@ -246,60 +388,116 @@ void LlamaRouterClient::ensureModelReady(const QString& targetModelId, double vr
 
     // Final step: refresh status and learn the context window (both best-effort)
     auto finishUp = [this, chain, targetModelId, done]() {
-        fetchModels([this, chain, targetModelId, done](bool, const QVector<ModelInfo>&, const QString&) {
-            fetchContextLength(targetModelId, [chain, done](int) {
-                done(true, chain->log.trimmed(), chain->clock.elapsed());
-            });
+        fetchContextLength(targetModelId, [chain, done](int) {
+            done(true, chain->log.trimmed(), chain->clock.elapsed());
         });
     };
 
-    auto loadIfNeeded = [this, chain, targetModelId, fail, finishUp]() {
-        if (chain->resident) {
-            finishUp();
-            return;
-        }
-        loadModel(targetModelId, [targetModelId, fail, finishUp](bool ok, const QString& err) {
-            if (!ok) {
-                fail(QStringLiteral("Failed to load model %1: %2").arg(targetModelId, err));
-                return;
-            }
-            finishUp();
-        });
-    };
-
-    // Unload evictions one after another; a failed unload is logged but not fatal
-    auto unloadNext = std::make_shared<std::function<void()>>();
-    *unloadNext = [this, chain, targetModelId, vramBudgetGiB, loadIfNeeded, weakNext = std::weak_ptr(unloadNext)]() {
-        if (chain->evictions.isEmpty()) {
-            loadIfNeeded();
-            return;
-        }
-        const QString evictId = chain->evictions.takeFirst();
-        const QString msg = QStringLiteral("VRAM Manager: Unloading %1 to fit %2 within %3 GiB budget...")
-                                .arg(evictId, targetModelId, QString::number(vramBudgetGiB, 'f', 1));
-        emit vramSwapNotification(msg);
-        chain->log += msg + "\n";
-        // The pending request keeps the chain alive; the weak self-reference avoids a cycle
-        unloadModel(evictId, [chain, evictId, self = weakNext.lock()](bool ok, const QString& err) {
-            if (!ok) chain->log += QStringLiteral("Unload of %1 failed: %2\n").arg(evictId, err);
-            (*self)();
-        });
-    };
-
-    fetchModels([this, chain, targetModelId, vramBudgetGiB, fail, unloadNext](
+    fetchModels([this, chain, targetModelId, vramBudgetGiB, upcoming, fail, finishUp](
                     bool online, const QVector<ModelInfo>& models, const QString& err) {
         if (!online) {
             fail(QStringLiteral("Router offline at %1 (%2)").arg(m_baseUrl, err));
             return;
         }
-        chain->evictions = planEvictionsForModel(models, targetModelId, vramBudgetGiB);
+        QString status = "unloaded";
         for (const auto& m : models) {
-            if (m.id == targetModelId && (m.status == "loaded" || m.status == "sleeping" || m.status == "loading")) {
-                chain->resident = true;
-                break;
-            }
+            if (m.id == targetModelId) status = m.status;
         }
-        (*unloadNext)();
+        if (status == "loaded") {
+            finishUp();
+            return;
+        }
+
+        auto bringUp = [this, chain, targetModelId, status, fail, finishUp]() {
+            auto onUp = [targetModelId, fail, finishUp](bool ok, const QString& error) {
+                if (!ok) {
+                    fail(QStringLiteral("Failed to load model %1: %2").arg(targetModelId, error));
+                    return;
+                }
+                finishUp();
+            };
+            if (status == "sleeping") {
+                emit vramSwapNotification(QStringLiteral("Waking %1...").arg(targetModelId));
+                wakeModel(targetModelId, onUp);
+            } else {
+                if (status != "loading") {
+                    emit vramSwapNotification(QStringLiteral("Loading %1...").arg(targetModelId));
+                }
+                loadAndWait(targetModelId, onUp);
+            }
+        };
+
+        // A loading model (e.g. preloaded) already has its room; a sleeping one needs it back
+        const QStringList evictions = (status == "loading")
+            ? QStringList{}
+            : planEvictions(models, targetModelId, vramBudgetGiB, upcoming).value_or(QStringList{});
+        if (evictions.isEmpty()) {
+            bringUp();
+            return;
+        }
+        const QString msg = QStringLiteral("VRAM Manager: Unloading %1 to fit %2 within %3 GiB budget...")
+                                .arg(evictions.join(", "), targetModelId, QString::number(vramBudgetGiB, 'f', 1));
+        emit vramSwapNotification(msg);
+        chain->log += msg + "\n";
+        const quint64 generation = m_abortGeneration;
+        unloadAndWait(evictions, [this, chain, bringUp, fail, generation](const QString& unloadLog) {
+            chain->log += unloadLog;
+            if (generation != m_abortGeneration) {
+                fail(QStringLiteral("Cancelled."));
+                return;
+            }
+            bringUp();
+        });
+    });
+}
+
+void LlamaRouterClient::prefetchModel(const QString& targetModelId, double vramBudgetGiB, const QStringList& upcoming,
+                                      const QSet<QString>& keep, std::function<void(const QString&)> done) {
+    fetchModels([this, targetModelId, vramBudgetGiB, upcoming, keep, done](
+                    bool online, const QVector<ModelInfo>& models, const QString&) {
+        if (!online) {
+            done(QStringLiteral("router offline"));
+            return;
+        }
+        ModelInfo target;
+        target.status = "unloaded";
+        for (const auto& m : models) {
+            if (m.id == targetModelId) target = m;
+        }
+        if (occupiesVram(target.status)) {
+            done(QStringLiteral("already loaded"));
+            return;
+        }
+        const auto plan = planEvictions(models, targetModelId, vramBudgetGiB, upcoming, keep);
+        if (!plan) {
+            QString path = target.path;
+            if (path.isEmpty()) {
+                for (const auto& local : scanLocalGgufModels()) {
+                    if (local.id == targetModelId) path = local.path;
+                }
+            }
+            warmFileCache(path);
+            done(path.isEmpty() ? QStringLiteral("doesn't fit next to the current model")
+                                : QStringLiteral("doesn't fit next to the current model; reading its file into RAM"));
+            return;
+        }
+        const bool sleeping = (target.status == "sleeping");
+        const quint64 generation = m_abortGeneration;
+        unloadAndWait(*plan, [this, targetModelId, sleeping, plan, done, generation](const QString&) {
+            if (generation != m_abortGeneration) {
+                done(QStringLiteral("cancelled"));
+                return;
+            }
+            const QString evicted = plan->isEmpty() ? QString() : QStringLiteral(" (unloaded %1)").arg(plan->join(", "));
+            if (sleeping) {
+                wakeModel(targetModelId, [](bool, const QString&) {});
+                done("waking" + evicted);
+            } else {
+                loadModel(targetModelId, [done, evicted](bool ok, const QString& err) {
+                    done(ok ? "loading" + evicted : "load failed: " + err);
+                });
+            }
+        });
     });
 }
 

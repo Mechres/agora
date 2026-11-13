@@ -75,6 +75,8 @@ private slots:
     void testExternalProviderParticipant();
     void testFetchProviderModels();
     void testDoneWaitsForEveryParticipant();
+    void testPreloadsNextSpeakerWithinBudget();
+    void testSleepingSpeakerGetsRoomAndWakes();
 };
 
 void AgoraFlowTest::testStartCommandIsAsyncAndConcurrent() {
@@ -611,6 +613,118 @@ void AgoraFlowTest::testDoneWaitsForEveryParticipant() {
     orch.startDebate();
     QTRY_VERIFY_WITH_TIMEOUT(!orch.isRunning(), 30000);
     QCOMPARE(server2.chatRequests().size(), 1);
+}
+
+namespace {
+
+RoomSession threeModelRoom(const QString& workspace) {
+    RoomSession s = singleCoderSession(workspace);
+    s.participants.clear();
+    for (const QString& name : {QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c")}) {
+        Participant p;
+        p.id = "p_" + name;
+        p.handle = "@" + name;
+        p.displayName = name.toUpper();
+        p.modelId = "model-" + name;
+        s.participants.append(p);
+    }
+    s.vramBudgetGiB = 7.0; // two 3 GiB models fit, three don't
+    return s;
+}
+
+} // namespace
+
+void AgoraFlowTest::testPreloadsNextSpeakerWithinBudget() {
+    QTemporaryDir ws;
+    FakeLlamaServer server;
+    for (const char* id : {"model-a", "model-b", "model-c"}) server.addModel(QString::fromLatin1(id), "unloaded", 3.0);
+    server.setLoadDelayMs(150);
+    for (int i = 0; i < 3; ++i) server.enqueueChat({200, FakeLlamaServer::sse("Turn " + QString::number(i))});
+
+    BwrapSandbox sandbox(ws.path());
+    ToolEngine tools(&sandbox);
+    LlamaRouterClient router;
+    router.setBaseUrl(server.baseUrl());
+    router.setStatusPollIntervalMs(20);
+    Orchestrator orch(&router, &tools);
+    orch.setAutoCheckpoints(false);
+    RoomSession s = threeModelRoom(ws.path());
+    s.maxRounds = 3;
+    orch.setSession(s);
+    orch.addUserMessage("go");
+
+    orch.startDebate();
+    QTRY_VERIFY_WITH_TIMEOUT(!orch.isRunning(), 30000);
+    const QStringList ev = server.events();
+    qDebug() << ev;
+
+    QCOMPARE(server.chatRequests().size(), 3);
+    QCOMPARE(server.chatsBeforeModelReady(), 0); // every turn waited for its model to be up
+    QVERIFY2(server.peakVramGiB() <= 7.0, qPrintable(QString::number(server.peakVramGiB())));
+    // Each model was loaded exactly once; b and c were started during the previous turn
+    QCOMPARE(ev.count("load model-a"), 1);
+    QCOMPARE(ev.count("load model-b"), 1);
+    QCOMPARE(ev.count("load model-c"), 1);
+    QVERIFY(ev.indexOf("load model-b") < ev.indexOf("chat model-b"));
+    QVERIFY(ev.indexOf("chat model-a") < ev.indexOf("load model-b")); // preloaded while a spoke
+    QVERIFY(ev.indexOf("chat model-b") < ev.indexOf("load model-c"));
+    // Making room for c unloaded a, never b which was speaking
+    QVERIFY(ev.contains("unload model-a"));
+    QVERIFY(!ev.contains("unload model-b"));
+    QVERIFY(ev.indexOf("unload model-a") < ev.indexOf("load model-c"));
+
+    // With preloading off, loads happen only at turn start
+    FakeLlamaServer server2;
+    for (const char* id : {"model-a", "model-b", "model-c"}) server2.addModel(QString::fromLatin1(id), "unloaded", 3.0);
+    for (int i = 0; i < 2; ++i) server2.enqueueChat({200, FakeLlamaServer::sse("Turn")});
+    router.setBaseUrl(server2.baseUrl());
+    orch.setPreloadNextModel(false);
+    s.maxRounds = 2;
+    orch.setSession(s);
+    orch.addUserMessage("go");
+    orch.startDebate();
+    QTRY_VERIFY_WITH_TIMEOUT(!orch.isRunning(), 30000);
+    const QStringList ev2 = server2.events();
+    QVERIFY(ev2.indexOf("chat model-a") < ev2.indexOf("load model-b"));
+    QCOMPARE(server2.chatsBeforeModelReady(), 0);
+}
+
+void AgoraFlowTest::testSleepingSpeakerGetsRoomAndWakes() {
+    QTemporaryDir ws;
+    FakeLlamaServer server;
+    // b is asleep (no VRAM); a and c are loaded and fill 6 of the 7 GiB
+    server.addModel("model-a", "loaded", 3.0);
+    server.addModel("model-b", "sleeping", 3.0);
+    server.addModel("model-c", "loaded", 3.0);
+    server.enqueueChat({200, FakeLlamaServer::sse("b speaking")});
+
+    BwrapSandbox sandbox(ws.path());
+    ToolEngine tools(&sandbox);
+    LlamaRouterClient router;
+    router.setBaseUrl(server.baseUrl());
+    router.setStatusPollIntervalMs(20);
+    Orchestrator orch(&router, &tools);
+    orch.setAutoCheckpoints(false);
+    RoomSession s = threeModelRoom(ws.path());
+    s.maxRounds = 1;
+    orch.setSession(s);
+    orch.addUserMessage("@b please start");
+
+    orch.startDebate();
+    QTRY_VERIFY_WITH_TIMEOUT(!orch.isRunning(), 30000);
+    const QStringList ev = server.events();
+    qDebug() << ev;
+
+    QCOMPARE(server.chatRequests().size(), 1);
+    QCOMPARE(server.chatsBeforeModelReady(), 0);
+    QVERIFY2(server.peakVramGiB() <= 7.0, qPrintable(QString::number(server.peakVramGiB())));
+    // After b comes c, then a: a is needed latest, so a makes room
+    QVERIFY(ev.contains("unload model-a"));
+    QVERIFY(!ev.contains("unload model-c"));
+    // Woken with a request, not /models/load (which the router rejects for a sleeping model)
+    QVERIFY(ev.contains("wake model-b"));
+    QVERIFY(!ev.contains("load model-b"));
+    QVERIFY(ev.indexOf("unload model-a") < ev.indexOf("wake model-b"));
 }
 
 QTEST_GUILESS_MAIN(AgoraFlowTest)
