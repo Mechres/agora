@@ -74,6 +74,7 @@ private slots:
     void testDeniedToolAndStopDuringApproval();
     void testExternalProviderParticipant();
     void testFetchProviderModels();
+    void testDoneWaitsForEveryParticipant();
 };
 
 void AgoraFlowTest::testStartCommandIsAsyncAndConcurrent() {
@@ -544,6 +545,72 @@ void AgoraFlowTest::testFetchProviderModels() {
     });
     QTRY_VERIFY_WITH_TIMEOUT(done, 10000);
     QVERIFY(!ok);
+}
+
+void AgoraFlowTest::testDoneWaitsForEveryParticipant() {
+    QTemporaryDir ws;
+    FakeLlamaServer server;
+    // A three-person room where the first speaker immediately claims the task is done
+    server.enqueueChat({200, FakeLlamaServer::sse("I wrote everything myself. [DONE]")});
+    server.enqueueChat({200, FakeLlamaServer::sse("Reviewed it; one fix needed. -> @tester")});
+    server.enqueueChat({200, FakeLlamaServer::sse("Tests pass. [DONE]")});
+
+    BwrapSandbox sandbox(ws.path());
+    ToolEngine tools(&sandbox);
+    LlamaRouterClient router;
+    router.setBaseUrl(server.baseUrl());
+    Orchestrator orch(&router, &tools);
+    orch.setAutoCheckpoints(false);
+
+    RoomSession s = singleCoderSession(ws.path());
+    Participant product = s.participants[0];
+    product.id = "p_product";
+    product.handle = "@product";
+    Participant reviewer = s.participants[0];
+    reviewer.id = "p_reviewer";
+    reviewer.handle = "@reviewer";
+    Participant tester = s.participants[0];
+    tester.id = "p_tester";
+    tester.handle = "@tester";
+    s.participants = {product, reviewer, tester};
+    orch.setSession(s);
+    orch.addUserMessage("Build the game");
+
+    orch.startDebate();
+    QTRY_VERIFY_WITH_TIMEOUT(!orch.isRunning(), 30000);
+
+    // All three spoke; the early [DONE] became a hand-off note naming the next speaker
+    QCOMPARE(server.chatRequests().size(), 3);
+    QStringList speakers;
+    QString note;
+    for (const auto& m : orch.session().messages) {
+        if (m.senderId == "system") note = m.content;
+        else if (m.senderId != "user") speakers << m.senderHandle;
+    }
+    QCOMPARE(speakers, (QStringList{"@product", "@reviewer", "@tester"}));
+    QVERIFY2(note.startsWith("@reviewer, it's your turn"), qPrintable(note));
+    QVERIFY(!note.contains("@product")); // only the next speaker is @mentioned
+    QVERIFY(orch.session().messages.last().content.contains("[DONE]"));
+
+    // Pure helper: a new user message resets who has spoken
+    QVector<ChatMessage> history = orch.session().messages;
+    QVERIFY(Orchestrator::participantsYetToSpeak(s.participants, history).isEmpty());
+    ChatMessage followUp;
+    followUp.senderId = "user";
+    history.append(followUp);
+    QCOMPARE(Orchestrator::participantsYetToSpeak(s.participants, history).size(), 3);
+
+    // @mention-only rooms still end on the first [DONE]
+    FakeLlamaServer server2;
+    server2.enqueueChat({200, FakeLlamaServer::sse("Done here. [DONE]")});
+    router.setBaseUrl(server2.baseUrl());
+    s.mode = DebateMode::MentionsOnly;
+    s.messages.clear();
+    orch.setSession(s);
+    orch.addUserMessage("@reviewer check this");
+    orch.startDebate();
+    QTRY_VERIFY_WITH_TIMEOUT(!orch.isRunning(), 30000);
+    QCOMPARE(server2.chatRequests().size(), 1);
 }
 
 QTEST_GUILESS_MAIN(AgoraFlowTest)

@@ -86,6 +86,9 @@ public:
                                               const QString& workspacePath = QStringLiteral("/workspace"),
                                               int maxContextChars = kDefaultMaxContextChars);
     static bool declaresDone(const QString& content);
+    // Enabled participants with no turn since the user's latest message, in roster order
+    static QStringList participantsYetToSpeak(const QVector<Participant>& participants,
+                                              const QVector<ChatMessage>& history);
     static bool needsApproval(ToolApprovalPolicy policy,
                               const QString& toolName,
                               const QSet<QString>& approvedForSession);
@@ -131,6 +134,7 @@ private:
     void clearPartialReply();
     void runToolCall(int messageIndex, const QVector<ToolCall>& calls, int callIndex, quint64 genId);
     void finalizeTurn(int messageIndex, quint64 genId);
+    void appendSystemNote(const QString& text);
 
     void requestApproval(const QString& speakerHandle, const ToolCall& call,
                          std::function<void(ToolApprovalDecision, const QString&)> onDecision);

@@ -176,6 +176,21 @@ bool Orchestrator::declaresDone(const QString& content) {
     return content.contains(QStringLiteral("[DONE]"));
 }
 
+QStringList Orchestrator::participantsYetToSpeak(const QVector<Participant>& participants,
+                                                 const QVector<ChatMessage>& history) {
+    QSet<QString> spoke;
+    for (int i = history.size() - 1; i >= 0; --i) {
+        const ChatMessage& msg = history[i];
+        if (msg.senderId == "user") break;
+        if (msg.senderId != "system") spoke.insert(msg.senderId);
+    }
+    QStringList waiting;
+    for (const auto& p : participants) {
+        if (p.enabled && !spoke.contains(p.id)) waiting << p.handle;
+    }
+    return waiting;
+}
+
 bool Orchestrator::needsApproval(ToolApprovalPolicy policy,
                                  const QString& toolName,
                                  const QSet<QString>& approvedForSession) {
@@ -223,10 +238,12 @@ QJsonArray Orchestrator::buildMessagesForSpeaker(const Participant& speaker,
         "### Collaboration & Sandboxed Coding Rules\n"
         "1. You share an isolated workspace mounted at `/workspace`.\n"
         "2. You have tools: `list_files`, `read_file`, `write_file`, `patch_file`, `run_command` (runs inside Bubblewrap sandbox), and `git_diff`.\n"
-        "3. To pass the floor or ask another participant a question, mention their `@handle` at the end of your response (e.g. `-> @coder` or `@reviewer`).\n"
+        "3. Stay in your role: do your own part of the task, then pass the floor by ending your message with the "
+        "`@handle` of the participant best suited for the next step (e.g. `-> @coder`). Do not do the whole task "
+        "alone; every participant in the roster has their own job.\n"
         "4. Do not impersonate other participants; speak only as %1.\n"
-        "5. When the user's task is fully complete and verified in the sandbox, end your message with "
-        "`[DONE]` to close the session. Never write it otherwise.\n")
+        "5. Write `[DONE]` at the end of your message only when the user's task is fully complete, verified in "
+        "the sandbox, and every participant has contributed. Never write it otherwise.\n")
         .arg(speaker.handle,
              speaker.displayName,
              speaker.systemPrompt,
@@ -726,18 +743,51 @@ void Orchestrator::runToolCall(int messageIndex, const QVector<ToolCall>& calls,
     });
 }
 
+void Orchestrator::appendSystemNote(const QString& text) {
+    ChatMessage note;
+    note.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    note.senderId = "system";
+    note.senderHandle = "@agora";
+    note.displayName = "Agora";
+    note.colorHex = "#a78bfa";
+    note.timestamp = QDateTime::currentDateTime().toString("HH:mm:ss");
+    note.content = text;
+    m_session.messages.append(note);
+    m_session.updatedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    emit messageAdded(m_session.messages.size() - 1, note);
+}
+
 void Orchestrator::finalizeTurn(int messageIndex, quint64 genId) {
     m_session.updatedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
     const QString handle = m_turnSpeaker.handle;
-    const bool done = declaresDone(m_session.messages[messageIndex].content);
+    bool done = declaresDone(m_session.messages[messageIndex].content);
+    // In round-robin rooms one participant can't end the run for everyone: [DONE] counts only
+    // once every enabled participant has had a turn since the user's latest message
+    QStringList waiting;
+    if (done && m_session.mode == DebateMode::RoundRobinWithMentions) {
+        waiting = participantsYetToSpeak(m_session.participants, m_session.messages);
+        if (!waiting.isEmpty()) done = false;
+    }
 
-    auto advance = [this, genId, done, handle]() {
+    auto advance = [this, genId, done, handle, waiting]() {
         if (!alive(genId)) return;
         m_completedTurns++;
         emit debateStateChanged(true, m_completedTurns, m_session.maxRounds);
         if (done) {
             endRun(QStringLiteral("%1 marked the task complete [DONE].").arg(handle));
             return;
+        }
+        if (!waiting.isEmpty()) {
+            // The first @mention in the latest message picks the next speaker
+            appendSystemNote(QStringLiteral(
+                "%1, it's your turn. %2 considers the task complete, but %3 not contributed yet, so the "
+                "session continues. Review the work so far from your role's perspective: improve it, "
+                "fix problems, or confirm it, then hand off.")
+                .arg(waiting.first(), QString(handle).remove('@'),
+                     waiting.size() == 1 ? QStringLiteral("you have")
+                                         : waiting.join(", ").remove('@') + QStringLiteral(" have")));
+            emit statusNotification(QStringLiteral("%1 said [DONE], but %2 still to speak; continuing.")
+                                        .arg(handle, waiting.join(", ")));
         }
         QTimer::singleShot(150, this, [this, genId]() {
             if (alive(genId)) scheduleNextTurn();
@@ -813,19 +863,9 @@ void Orchestrator::restoreCheckpointBefore(int messageIndex) {
             emit errorNotification("Restore failed: " + savedOrError);
             return;
         }
-        ChatMessage note;
-        note.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-        note.senderId = "system";
-        note.senderHandle = "@agora";
-        note.displayName = "Agora";
-        note.colorHex = "#a78bfa";
-        note.timestamp = QDateTime::currentDateTime().toString("HH:mm:ss");
-        note.content = QStringLiteral("Workspace restored to its state before %1's turn (checkpoint %2). "
-                                      "The state just before this restore was saved as checkpoint %3.")
-                           .arg(handle, target.left(10), savedOrError.left(10));
-        m_session.messages.append(note);
-        m_session.updatedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
-        emit messageAdded(m_session.messages.size() - 1, note);
+        appendSystemNote(QStringLiteral("Workspace restored to its state before %1's turn (checkpoint %2). "
+                                        "The state just before this restore was saved as checkpoint %3.")
+                             .arg(handle, target.left(10), savedOrError.left(10)));
         emit workspaceChanged();
         emit statusNotification(QStringLiteral("Workspace restored."));
     });
