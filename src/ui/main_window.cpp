@@ -5,16 +5,22 @@
 #include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <algorithm>
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
+#include <QPainter>
+#include <QPixmap>
 #include <QFormLayout>
+#include <QFrame>
 #include <QJsonArray>
 #include <QHBoxLayout>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QSettings>
@@ -28,7 +34,7 @@
 namespace agora {
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
-    setWindowTitle("Agora — Multi-Model Local Debate & Sandboxed Coding Studio");
+    setWindowTitle("Agora");
     resize(1540, 920);
 
     const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
@@ -36,8 +42,16 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     m_store = std::make_unique<SessionStore>(dataDir + "/sessions.db");
     m_store->initialize();
 
-    const QString defaultWs = dataDir + "/workspaces/session_" +
-                              QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+    // Reopen the room from last time when it still exists; otherwise start a fresh one
+    std::optional<RoomSession> restored;
+    const QString lastSessionId = QSettings().value("room/lastSessionId").toString();
+    if (!lastSessionId.isEmpty()) {
+        restored = m_store->loadSession(lastSessionId);
+        if (restored && (restored->workspacePath.isEmpty() || !QDir(restored->workspacePath).exists())) {
+            restored.reset();
+        }
+    }
+    const QString defaultWs = restored ? restored->workspacePath : newWorkspacePath();
     QDir().mkpath(defaultWs);
 
     m_sandbox = new BwrapSandbox(defaultWs, this);
@@ -50,7 +64,19 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     m_orchestrator->setCheckpointStore(m_checkpoints);
     loadAppSettings();
 
-    m_orchestrator->session().workspacePath = defaultWs;
+    if (restored) {
+        m_sandbox->setAllowNetwork(restored->allowSandboxNetwork);
+        m_orchestrator->setSession(*restored);
+    } else {
+        QSettings settings;
+        RoomSession& fresh = m_orchestrator->session();
+        fresh.workspacePath = defaultWs;
+        fresh.title = "New Agora Debate";
+        fresh.maxRounds = settings.value("room/maxRounds", fresh.maxRounds).toInt();
+        fresh.vramBudgetGiB = settings.value("room/vramBudgetGiB", fresh.vramBudgetGiB).toDouble();
+        fresh.mode = static_cast<DebateMode>(settings.value("room/mode", static_cast<int>(fresh.mode)).toInt());
+        fresh.participants = loadSavedRoster();
+    }
 
     m_fsWatcher = new QFileSystemWatcher(this);
     m_fsWatcher->addPath(defaultWs);
@@ -70,16 +96,18 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                     }
                 }
                 if (online) {
-                    m_routerBadge->setText(QStringLiteral("● Router Online (%1 models | %2 loaded, %3 GiB)")
+                    m_routerBadge->setText(QStringLiteral("● Router online · %1 models · %2 loaded (%3 GiB)")
                                                .arg(QString::number(models.size()),
                                                     QString::number(loadedCount),
                                                     QString::number(loadedGiB, 'f', 1)));
-                    m_routerBadge->setStyleSheet("color: #4ade80; font-weight: bold; padding: 4px 8px;");
+                    m_routerBadge->setProperty("state", "online");
                 } else {
-                    m_routerBadge->setText(QStringLiteral("○ Router Offline (%1 local GGUFs found)")
+                    m_routerBadge->setText(QStringLiteral("○ Router offline · %1 local GGUFs")
                                                .arg(QString::number(models.size())));
-                    m_routerBadge->setStyleSheet("color: #f87171; font-weight: bold; padding: 4px 8px;");
+                    m_routerBadge->setProperty("state", "offline");
                 }
+                m_routerBadge->style()->unpolish(m_routerBadge);
+                m_routerBadge->style()->polish(m_routerBadge);
                 refreshParticipantsList();
             });
 
@@ -141,7 +169,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                 m_btnStep->setEnabled(!running);
                 m_btnStop->setEnabled(running);
                 if (!running) {
-                    m_store->saveSession(m_orchestrator->session());
+                    persistSession();
                     QTimer::singleShot(0, this, &MainWindow::refreshSessionsList);
                 } else {
                     m_transcriptPane->setStatusText(
@@ -153,7 +181,13 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     // Pick default models from local GGUFs right away; the router refresh is asynchronous
     m_availableModels = m_router->scanLocalGgufModels();
     onRefreshModels();
-    populateDefaultCouncil();
+    if (m_orchestrator->session().participants.isEmpty()) {
+        populateDefaultCouncil(); // first start, or the saved roster was emptied
+    } else {
+        refreshParticipantsList();
+        m_transcriptPane->setMentionParticipants(m_orchestrator->session().participants);
+    }
+    syncRoomControls();
     refreshSessionsList();
     m_workspacePane->refreshViews();
     m_transcriptPane->setMessages(m_orchestrator->session().messages);
@@ -197,6 +231,11 @@ void MainWindow::saveAppSettings() {
     settings.setValue("orchestrator/autoCheckpoints", m_orchestrator->autoCheckpoints());
     settings.setValue("orchestrator/approvalPolicy", static_cast<int>(m_orchestrator->toolApprovalPolicy()));
 
+    const RoomSession& room = m_orchestrator->session();
+    settings.setValue("room/maxRounds", room.maxRounds);
+    settings.setValue("room/vramBudgetGiB", room.vramBudgetGiB);
+    settings.setValue("room/mode", static_cast<int>(room.mode));
+
     QJsonArray provArr;
     for (const auto& prov : m_orchestrator->providers()) provArr.append(prov.toJson());
     settings.setValue("providers/list", QJsonDocument(provArr).toJson(QJsonDocument::Compact));
@@ -208,28 +247,40 @@ void MainWindow::setupUi() {
     rootLayout->setContentsMargins(8, 8, 8, 8);
     rootLayout->setSpacing(6);
 
-    // 1. Top Control Bar
+    // 1. Top Control Bar: router status on the left, run controls on the right
     auto* topBar = new QWidget(central);
+    topBar->setObjectName("topBar");
     auto* topLayout = new QHBoxLayout(topBar);
-    topLayout->setContentsMargins(4, 2, 4, 2);
-    topLayout->setSpacing(8);
+    topLayout->setContentsMargins(10, 6, 10, 6);
+    topLayout->setSpacing(6);
 
-    m_routerBadge = new QLabel("Checking router...", topBar);
-    m_btnRefreshModels = new QPushButton("Refresh Models", topBar);
+    auto* brand = new QLabel("◆ Agora", topBar);
+    brand->setObjectName("brand");
+    m_routerBadge = new QLabel("Checking router…", topBar);
+    m_routerBadge->setObjectName("routerBadge");
+    m_btnRefreshModels = new QPushButton("⟳", topBar);
+    m_btnRefreshModels->setToolTip("Refresh the model list from the router");
+    m_btnRefreshModels->setProperty("role", "ghost");
     m_btnStartRouter = new QPushButton("Start Router", topBar);
+    m_btnStartRouter->setProperty("role", "ghost");
     m_btnSettings = new QPushButton("⚙ Settings", topBar);
+    m_btnSettings->setProperty("role", "ghost");
     m_btnProviders = new QPushButton("☁ Providers", topBar);
+    m_btnProviders->setProperty("role", "ghost");
     m_btnProviders->setToolTip("External OpenAI-compatible APIs (OpenAI, Anthropic, Gemini, OpenRouter, Ollama, ...)");
 
     m_comboMode = new QComboBox(topBar);
-    m_comboMode->addItem("Round-Robin + @mention", static_cast<int>(DebateMode::RoundRobinWithMentions));
-    m_comboMode->addItem("@mention Only", static_cast<int>(DebateMode::MentionsOnly));
-    m_comboMode->addItem("Single Turn", static_cast<int>(DebateMode::SingleTurn));
+    m_comboMode->addItem("Round-robin + @mention", static_cast<int>(DebateMode::RoundRobinWithMentions));
+    m_comboMode->addItem("@mention only", static_cast<int>(DebateMode::MentionsOnly));
+    m_comboMode->addItem("Single turn", static_cast<int>(DebateMode::SingleTurn));
+    m_comboMode->setToolTip("Who speaks next: round-robin with @mention hand-offs, only @mentioned "
+                            "participants, or one turn at a time");
 
     m_spinMaxRounds = new QSpinBox(topBar);
     m_spinMaxRounds->setRange(1, 50);
     m_spinMaxRounds->setValue(8);
     m_spinMaxRounds->setSuffix(" turns");
+    m_spinMaxRounds->setToolTip("Maximum turns per run");
 
     m_spinVramBudget = new QDoubleSpinBox(topBar);
     m_spinVramBudget->setRange(1.0, 64.0);
@@ -238,26 +289,41 @@ void MainWindow::setupUi() {
     m_spinVramBudget->setSuffix(" GiB VRAM");
     m_spinVramBudget->setToolTip("Max combined GGUF size kept resident before auto-unloading previous models");
 
-    m_btnStart = new QPushButton("▶ Start / Continue", topBar);
-    m_btnStep = new QPushButton("⏭ Step 1 Turn", topBar);
+    m_btnStart = new QPushButton("▶ Start", topBar);
+    m_btnStart->setProperty("role", "primary");
+    m_btnStart->setToolTip("Start or continue the debate");
+    m_btnStep = new QPushButton("⏭ Step", topBar);
+    m_btnStep->setToolTip("Run a single turn");
     m_btnStop = new QPushButton("⏹ Stop", topBar);
+    m_btnStop->setProperty("role", "danger");
     m_btnStop->setEnabled(false);
-    m_btnExportMd = new QPushButton("Export .md", topBar);
+    m_btnExportMd = new QPushButton("Export", topBar);
+    m_btnExportMd->setProperty("role", "ghost");
+    m_btnExportMd->setToolTip("Export the transcript as Markdown");
 
+    auto separator = [topBar]() {
+        auto* line = new QFrame(topBar);
+        line->setObjectName("vsep");
+        line->setFixedSize(1, 22);
+        return line;
+    };
+
+    topLayout->addWidget(brand);
+    topLayout->addSpacing(6);
     topLayout->addWidget(m_routerBadge);
     topLayout->addWidget(m_btnRefreshModels);
     topLayout->addWidget(m_btnStartRouter);
-    topLayout->addWidget(m_btnSettings);
-    topLayout->addWidget(m_btnProviders);
     topLayout->addStretch();
-    topLayout->addWidget(new QLabel("Mode:", topBar));
     topLayout->addWidget(m_comboMode);
-    topLayout->addWidget(new QLabel("Max:", topBar));
     topLayout->addWidget(m_spinMaxRounds);
     topLayout->addWidget(m_spinVramBudget);
+    topLayout->addWidget(separator());
     topLayout->addWidget(m_btnStart);
     topLayout->addWidget(m_btnStep);
     topLayout->addWidget(m_btnStop);
+    topLayout->addWidget(separator());
+    topLayout->addWidget(m_btnProviders);
+    topLayout->addWidget(m_btnSettings);
     topLayout->addWidget(m_btnExportMd);
 
     rootLayout->addWidget(topBar);
@@ -270,24 +336,52 @@ void MainWindow::setupUi() {
     auto* leftLayout = new QVBoxLayout(leftPane);
     leftLayout->setContentsMargins(4, 4, 4, 4);
 
-    auto* lblRoster = new QLabel("<b>Room Participants (Models)</b>", leftPane);
+    auto* lblRoster = new QLabel("PARTICIPANTS", leftPane);
+    lblRoster->setProperty("role", "section");
     m_listParticipants = new QListWidget(leftPane);
+    m_listParticipants->setObjectName("participantList");
+    m_listParticipants->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_listParticipants->setSpacing(2);
 
     auto* rosterBtnRow = new QHBoxLayout();
     auto* btnAddP = new QPushButton("+ Add", leftPane);
     auto* btnEditP = new QPushButton("Edit", leftPane);
     auto* btnDelP = new QPushButton("Remove", leftPane);
+    btnDelP->setProperty("role", "ghost");
     rosterBtnRow->addWidget(btnAddP);
     rosterBtnRow->addWidget(btnEditP);
     rosterBtnRow->addWidget(btnDelP);
 
-    auto* btnPresetCouncil = new QPushButton("⚡ Load Default Coding Council", leftPane);
+    auto* btnPresetCouncil = new QPushButton("⚡ Load a Council…", leftPane);
+    btnPresetCouncil->setToolTip("Replace the room with a ready-made team of roles");
+    auto* councilMenu = new QMenu(btnPresetCouncil);
+    for (const auto& council : defaultCouncilTemplates()) {
+        QStringList handles = council.handles;
+        QAction* act = councilMenu->addAction(QStringLiteral("%1 — %2").arg(council.name, handles.join(' ')));
+        act->setToolTip(council.description);
+        connect(act, &QAction::triggered, this, [this, council]() {
+            if (!m_orchestrator->session().participants.isEmpty() &&
+                QMessageBox::question(this, "Load Council",
+                                      QStringLiteral("Replace the current participants with the %1?\n\n"
+                                                     "Participants with the same handle keep their model, "
+                                                     "provider and prompt.").arg(council.name)) != QMessageBox::Yes) {
+                return;
+            }
+            loadCouncil(council);
+        });
+    }
+    btnPresetCouncil->setMenu(councilMenu);
 
-    auto* lblSessions = new QLabel("<b>Saved Sessions</b>", leftPane);
+    auto* lblSessions = new QLabel("SESSIONS", leftPane);
+    lblSessions->setProperty("role", "section");
     m_listSessions = new QListWidget(leftPane);
+    m_listSessions->setObjectName("sessionList");
+    m_listSessions->setContextMenuPolicy(Qt::CustomContextMenu);
+    m_listSessions->setToolTip("Double-click to open; right-click to delete");
     auto* sessionBtnRow = new QHBoxLayout();
-    auto* btnNewSession = new QPushButton("New Room", leftPane);
-    auto* btnSaveSession = new QPushButton("Save Room", leftPane);
+    auto* btnNewSession = new QPushButton("+ New Room", leftPane);
+    auto* btnSaveSession = new QPushButton("Save", leftPane);
+    btnSaveSession->setProperty("role", "ghost");
     sessionBtnRow->addWidget(btnNewSession);
     sessionBtnRow->addWidget(btnSaveSession);
 
@@ -295,7 +389,7 @@ void MainWindow::setupUi() {
     leftLayout->addWidget(m_listParticipants, 3);
     leftLayout->addLayout(rosterBtnRow);
     leftLayout->addWidget(btnPresetCouncil);
-    leftLayout->addSpacing(8);
+    leftLayout->addSpacing(12);
     leftLayout->addWidget(lblSessions);
     leftLayout->addWidget(m_listSessions, 2);
     leftLayout->addLayout(sessionBtnRow);
@@ -336,7 +430,6 @@ void MainWindow::setupUi() {
     connect(btnAddP, &QPushButton::clicked, this, &MainWindow::onAddParticipantClicked);
     connect(btnEditP, &QPushButton::clicked, this, &MainWindow::onEditParticipantClicked);
     connect(btnDelP, &QPushButton::clicked, this, &MainWindow::onRemoveParticipantClicked);
-    connect(btnPresetCouncil, &QPushButton::clicked, this, &MainWindow::onResetCouncilPresetClicked);
     connect(m_listParticipants, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem*) {
         onEditParticipantClicked();
     });
@@ -344,6 +437,28 @@ void MainWindow::setupUi() {
     connect(btnNewSession, &QPushButton::clicked, this, &MainWindow::onNewSessionClicked);
     connect(btnSaveSession, &QPushButton::clicked, this, &MainWindow::onSaveSessionClicked);
     connect(m_listSessions, &QListWidget::itemDoubleClicked, this, &MainWindow::onSessionListDoubleClicked);
+    connect(m_listSessions, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+        QListWidgetItem* item = m_listSessions->itemAt(pos);
+        if (!item) return;
+        const QString id = item->data(Qt::UserRole).toString();
+        QMenu menu(this);
+        QAction* openAct = menu.addAction("Open");
+        QAction* deleteAct = menu.addAction("Delete…");
+        QAction* chosen = menu.exec(m_listSessions->viewport()->mapToGlobal(pos));
+        if (chosen == openAct) {
+            onSessionListDoubleClicked(item);
+        } else if (chosen == deleteAct) {
+            if (QMessageBox::question(this, "Delete Session",
+                                      QStringLiteral("Delete \"%1\" from saved sessions?\n\n"
+                                                     "Its workspace folder on disk is kept.")
+                                          .arg(item->data(Qt::UserRole + 1).toString())) != QMessageBox::Yes) {
+                return;
+            }
+            m_store->deleteSession(id);
+            if (id == m_orchestrator->session().id) QSettings().remove("room/lastSessionId");
+            refreshSessionsList();
+        }
+    });
 
     connect(m_transcriptPane, &TranscriptView::sendUserMessageRequested, this, &MainWindow::onSendUserMessage);
     connect(m_workspacePane, &WorkspacePane::browseWorkspaceRequested, this, &MainWindow::onBrowseWorkspaceClicked);
@@ -356,12 +471,76 @@ void MainWindow::setupUi() {
     });
 }
 
+namespace {
+
+// Stylesheets can't draw arrows without an image and the app ships no image files, so
+// small chevrons are drawn once into the cache directory
+QString arrowImagePath(bool up) {
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/ui";
+    const QString path = dir + (up ? "/arrow-up.png" : "/arrow-down.png");
+    if (QFileInfo::exists(path)) return path;
+    QDir().mkpath(dir);
+    QPixmap pix(16, 16);
+    pix.fill(Qt::transparent);
+    QPainter painter(&pix);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(QColor("#94a3b8"), 2.2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    const QPolygonF chevron = up ? QPolygonF({{3.5, 11}, {8, 5.5}, {12.5, 11}})
+                                 : QPolygonF({{3.5, 5.5}, {8, 11}, {12.5, 5.5}});
+    painter.drawPolyline(chevron);
+    painter.end();
+    pix.save(path);
+    return path;
+}
+
+} // namespace
+
 void MainWindow::applyDarkTheme() {
-    setStyleSheet(R"(
-        QMainWindow, QWidget {
-            background-color: #0f172a;
+    // Palette: slate background, blue accent; buttons come in default / primary / danger / ghost
+    QString css = QStringLiteral(R"(
+        QWidget {
             color: #e2e8f0;
             font-size: 13px;
+        }
+        QMainWindow, QDialog, QMessageBox {
+            background-color: #0f172a;
+        }
+        QLabel {
+            background: transparent;
+        }
+        QLabel[role="section"] {
+            color: #64748b;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 2px 2px 0px 2px;
+        }
+        #topBar {
+            background-color: #111c31;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+        }
+        #brand {
+            font-size: 15px;
+            font-weight: 800;
+            color: #f8fafc;
+        }
+        #routerBadge {
+            border-radius: 10px;
+            padding: 3px 10px;
+            font-weight: 600;
+            color: #94a3b8;
+            background-color: #1e293b;
+        }
+        #routerBadge[state="online"] {
+            color: #4ade80;
+            background-color: rgba(74, 222, 128, 0.10);
+        }
+        #routerBadge[state="offline"] {
+            color: #f87171;
+            background-color: rgba(248, 113, 113, 0.10);
+        }
+        #vsep {
+            background-color: #334155;
         }
         QListWidget, QPlainTextEdit, QTextBrowser, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
             background-color: #1e293b;
@@ -369,41 +548,235 @@ void MainWindow::applyDarkTheme() {
             border: 1px solid #334155;
             border-radius: 6px;
             padding: 4px;
+            selection-background-color: #2563eb;
+        }
+        QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+            border-color: #3b82f6;
+        }
+        QLineEdit:read-only {
+            color: #94a3b8;
+        }
+        QSpinBox, QDoubleSpinBox {
+            padding-right: 18px;
+        }
+        QSpinBox::up-button, QDoubleSpinBox::up-button,
+        QSpinBox::down-button, QDoubleSpinBox::down-button {
+            subcontrol-origin: border;
+            width: 16px;
+            background: #273449;
+            border-left: 1px solid #334155;
+        }
+        QSpinBox::up-button, QDoubleSpinBox::up-button {
+            subcontrol-position: top right;
+            border-top-right-radius: 6px;
+        }
+        QSpinBox::down-button, QDoubleSpinBox::down-button {
+            subcontrol-position: bottom right;
+            border-bottom-right-radius: 6px;
+        }
+        QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+        QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+            background: #334155;
+        }
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+            image: url(@ARROW_UP@);
+            width: 8px; height: 8px;
+        }
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow,
+        QComboBox::down-arrow {
+            image: url(@ARROW_DOWN@);
+            width: 8px; height: 8px;
+        }
+        QComboBox::drop-down {
+            border: none;
+            width: 18px;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #1e293b;
+            border: 1px solid #334155;
+            selection-background-color: #2563eb;
+            outline: 0;
+        }
+        QListWidget {
+            outline: 0;
+        }
+        QListWidget::item {
+            border-radius: 6px;
+            padding: 4px 6px;
+        }
+        QListWidget::item:hover {
+            background-color: #243247;
+        }
+        QListWidget::item:selected {
+            background-color: #1e3a5f;
+            color: #f8fafc;
+        }
+        #participantCard, #participantCard QWidget {
+            background: transparent;
+        }
+        #participantModel {
+            color: #64748b;
+            font-size: 11px;
         }
         QPushButton {
-            background-color: #1d4ed8;
-            color: #ffffff;
-            border: 1px solid #2563eb;
+            background-color: #1e293b;
+            color: #e2e8f0;
+            border: 1px solid #334155;
             border-radius: 6px;
-            padding: 5px 10px;
+            padding: 5px 12px;
             font-weight: 600;
         }
         QPushButton:hover {
-            background-color: #2563eb;
+            background-color: #273449;
+            border-color: #475569;
+        }
+        QPushButton:pressed {
+            background-color: #334155;
         }
         QPushButton:disabled {
-            background-color: #334155;
-            color: #64748b;
-            border-color: #334155;
+            background-color: #172033;
+            color: #475569;
+            border-color: #1e293b;
+        }
+        QPushButton::menu-indicator {
+            subcontrol-position: right center;
+            right: 8px;
+        }
+        QPushButton[role="primary"] {
+            background-color: #2563eb;
+            border-color: #3b82f6;
+            color: #ffffff;
+        }
+        QPushButton[role="primary"]:hover {
+            background-color: #3b82f6;
+        }
+        QPushButton[role="primary"]:disabled {
+            background-color: #172033;
+            color: #475569;
+            border-color: #1e293b;
+        }
+        QPushButton[role="danger"] {
+            background-color: rgba(239, 68, 68, 0.15);
+            border-color: #ef4444;
+            color: #fca5a5;
+        }
+        QPushButton[role="danger"]:hover {
+            background-color: rgba(239, 68, 68, 0.28);
+        }
+        QPushButton[role="danger"]:disabled {
+            background-color: #172033;
+            color: #475569;
+            border-color: #1e293b;
+        }
+        QPushButton[role="ghost"] {
+            background-color: transparent;
+            border-color: transparent;
+            color: #94a3b8;
+        }
+        QPushButton[role="ghost"]:hover {
+            background-color: #1e293b;
+            color: #e2e8f0;
+        }
+        QCheckBox {
+            spacing: 6px;
+            background: transparent;
+        }
+        QCheckBox::indicator {
+            width: 14px;
+            height: 14px;
+            border: 1px solid #475569;
+            border-radius: 4px;
+            background: #1e293b;
+        }
+        QCheckBox::indicator:checked {
+            background: #3b82f6;
+            border-color: #3b82f6;
         }
         QTabWidget::pane {
-            border: 1px solid #334155;
+            border: 1px solid #1e293b;
             border-radius: 6px;
+            top: -1px;
         }
         QTabBar::tab {
-            background: #1e293b;
+            background: transparent;
             color: #94a3b8;
-            padding: 6px 12px;
-            border-top-left-radius: 6px;
-            border-top-right-radius: 6px;
+            padding: 6px 14px;
+            border-bottom: 2px solid transparent;
             margin-right: 2px;
         }
+        QTabBar::tab:hover {
+            color: #e2e8f0;
+        }
         QTabBar::tab:selected {
-            background: #334155;
             color: #f8fafc;
+            border-bottom: 2px solid #3b82f6;
             font-weight: bold;
         }
+        QSplitter::handle {
+            background: transparent;
+        }
+        QSplitter::handle:hover {
+            background: #334155;
+        }
+        QSplitter::handle:horizontal {
+            width: 6px;
+        }
+        QSplitter::handle:vertical {
+            height: 6px;
+        }
+        QScrollBar:vertical {
+            background: transparent;
+            width: 10px;
+            margin: 2px;
+        }
+        QScrollBar:horizontal {
+            background: transparent;
+            height: 10px;
+            margin: 2px;
+        }
+        QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+            background: #334155;
+            border-radius: 3px;
+            min-height: 28px;
+            min-width: 28px;
+        }
+        QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+            background: #475569;
+        }
+        QScrollBar::add-line, QScrollBar::sub-line {
+            width: 0px;
+            height: 0px;
+        }
+        QScrollBar::add-page, QScrollBar::sub-page {
+            background: none;
+        }
+        QMenu {
+            background-color: #1e293b;
+            border: 1px solid #334155;
+            padding: 4px;
+        }
+        QMenu::item {
+            padding: 6px 18px;
+            border-radius: 4px;
+        }
+        QMenu::item:selected {
+            background-color: #2563eb;
+        }
+        QToolTip {
+            background-color: #1e293b;
+            color: #e2e8f0;
+            border: 1px solid #334155;
+            padding: 4px 6px;
+        }
+        QStatusBar {
+            background-color: #0b1220;
+            color: #94a3b8;
+            border-top: 1px solid #1e293b;
+        }
     )");
+    css.replace("@ARROW_UP@", arrowImagePath(true));
+    css.replace("@ARROW_DOWN@", arrowImagePath(false));
+    setStyleSheet(css);
 }
 
 void MainWindow::onRefreshModels() {
@@ -691,15 +1064,21 @@ bool MainWindow::showProviderEditDialog(ProviderConfig* inOutProvider, const QSt
 }
 
 void MainWindow::populateDefaultCouncil() {
-    auto& parts = m_orchestrator->session().participants;
-    parts.clear();
+    m_orchestrator->session().participants.clear();
+    loadCouncil(defaultCouncilTemplates().first());
+}
 
+void MainWindow::loadCouncil(const CouncilTemplate& council) {
+    // Model preferences for the default roles; other roles take the next available model
+    static const QHash<QString, QStringList> modelHints = {
+        {"@architect", {"Ornith", "Qwen3.8", "Xing", "Qwen3.5"}},
+        {"@coder", {"Qwopus", "coder", "Qwen3.5"}},
+        {"@reviewer", {"Qwen3.5-4B", "LFM2.5", "minicpm"}},
+    };
     auto pickModel = [this](const QStringList& preferredSubstrings, int fallbackIdx) -> QString {
         for (const QString& sub : preferredSubstrings) {
             for (const auto& m : m_availableModels) {
-                if (m.id.contains(sub, Qt::CaseInsensitive)) {
-                    return m.id;
-                }
+                if (m.id.contains(sub, Qt::CaseInsensitive)) return m.id;
             }
         }
         if (!m_availableModels.isEmpty()) {
@@ -708,44 +1087,88 @@ void MainWindow::populateDefaultCouncil() {
         return "Qwen3.5-4B-Q4_K_M";
     };
 
+    const QVector<Participant> previous = m_orchestrator->session().participants;
     const auto presets = defaultRolePresets();
-    if (presets.size() >= 3) {
-        Participant arch;
-        arch.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-        arch.handle = presets[0].handle;
-        arch.displayName = presets[0].displayName;
-        arch.colorHex = presets[0].colorHex;
-        arch.temperature = presets[0].temperature;
-        arch.systemPrompt = presets[0].systemPrompt;
-        arch.modelId = pickModel({"Ornith", "Qwen3.8", "Xing", "Qwen3.5"}, 0);
-        parts.append(arch);
-
-        Participant coder;
-        coder.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-        coder.handle = presets[1].handle;
-        coder.displayName = presets[1].displayName;
-        coder.colorHex = presets[1].colorHex;
-        coder.temperature = presets[1].temperature;
-        coder.systemPrompt = presets[1].systemPrompt;
-        coder.modelId = pickModel({"Qwopus", "coder", "Qwen3.5"}, 1);
-        parts.append(coder);
-
-        Participant rev;
-        rev.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-        rev.handle = presets[2].handle;
-        rev.displayName = presets[2].displayName;
-        rev.colorHex = presets[2].colorHex;
-        rev.temperature = presets[2].temperature;
-        rev.systemPrompt = presets[2].systemPrompt;
-        rev.modelId = pickModel({"Qwen3.5-4B", "LFM2.5", "minicpm"}, 2);
-        parts.append(rev);
+    QVector<Participant> parts;
+    for (int i = 0; i < council.handles.size(); ++i) {
+        const QString& handle = council.handles[i];
+        auto kept = std::find_if(previous.begin(), previous.end(),
+                                 [&handle](const Participant& p) { return p.handle == handle; });
+        if (kept != previous.end()) {
+            parts.append(*kept);
+            continue;
+        }
+        auto preset = std::find_if(presets.begin(), presets.end(),
+                                   [&handle](const RolePreset& r) { return r.handle == handle; });
+        if (preset == presets.end()) continue;
+        Participant p;
+        p.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        p.handle = preset->handle;
+        p.displayName = preset->displayName;
+        p.colorHex = preset->colorHex;
+        p.temperature = preset->temperature;
+        p.systemPrompt = preset->systemPrompt;
+        p.modelId = pickModel(modelHints.value(handle), i);
+        parts.append(p);
     }
+    m_orchestrator->session().participants = parts;
+    onRosterChanged();
+}
 
+void MainWindow::onRosterChanged() {
     refreshParticipantsList();
-    m_transcriptPane->setMentionParticipants(parts);
+    m_transcriptPane->setMentionParticipants(m_orchestrator->session().participants);
+    saveRoster();
+    persistSession();
+}
+
+void MainWindow::saveRoster() const {
+    QJsonArray arr;
+    for (const auto& p : m_orchestrator->session().participants) arr.append(p.toJson());
+    QSettings().setValue("room/roster", QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+QVector<Participant> MainWindow::loadSavedRoster() const {
+    QVector<Participant> parts;
+    const QJsonArray arr = QJsonDocument::fromJson(QSettings().value("room/roster").toByteArray()).array();
+    for (const auto& v : arr) parts.append(Participant::fromJson(v.toObject()));
+    return parts;
+}
+
+void MainWindow::persistSession() {
+    const RoomSession& room = m_orchestrator->session();
+    if (room.messages.isEmpty()) return; // nothing worth a saved-sessions entry yet
+    QString err;
+    if (!m_store->saveSession(room, &err)) {
+        statusBar()->showMessage("Could not save session: " + err, 8000);
+        return;
+    }
+    QSettings().setValue("room/lastSessionId", room.id);
+}
+
+void MainWindow::syncRoomControls() {
+    const RoomSession& room = m_orchestrator->session();
+    m_spinMaxRounds->setValue(room.maxRounds);
+    m_spinVramBudget->setValue(room.vramBudgetGiB);
+    m_comboMode->setCurrentIndex(qMax(0, m_comboMode->findData(static_cast<int>(room.mode))));
+    m_workspacePane->setAllowNetwork(room.allowSandboxNetwork);
+}
+
+QString MainWindow::newWorkspacePath() const {
+    const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    return dataDir + "/workspaces/session_" + QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    m_orchestrator->stopDebate();
+    saveRoster();
+    saveAppSettings();
+    persistSession();
+    QMainWindow::closeEvent(event);
 }
 
 void MainWindow::refreshParticipantsList() {
+    const int previousRow = m_listParticipants->currentRow();
     m_listParticipants->clear();
     QMap<QString, ModelInfo> modelMap;
     for (const auto& m : m_availableModels) {
@@ -753,38 +1176,91 @@ void MainWindow::refreshParticipantsList() {
     }
 
     for (const auto& p : m_orchestrator->session().participants) {
-        const ModelInfo mi = p.providerId.isEmpty() ? modelMap.value(p.modelId) : ModelInfo{};
-        QString stateStr = mi.status.isEmpty() ? QStringLiteral("unloaded") : mi.status;
-        if (!p.providerId.isEmpty()) {
-            stateStr = m_orchestrator->providerFor(p) ? ("☁ " + providerName(p.providerId))
-                                                      : QStringLiteral("☁ provider missing");
-        }
         const bool isSpeaking = (p.id == m_orchestrator->activeSpeakerId());
-        const QString sizeTag = mi.sizeGiB > 0.01
-                                    ? QStringLiteral(" · %1 GiB").arg(QString::number(mi.sizeGiB, 'f', 1))
-                                    : QString();
+        const bool external = !p.providerId.isEmpty();
+        const ModelInfo mi = external ? ModelInfo{} : modelMap.value(p.modelId);
 
-        const QString label = QStringLiteral("%1 %2 (%3)\n   Model: %4 [%5%6]")
-                                  .arg(isSpeaking ? QStringLiteral("🔊") : (p.enabled ? QStringLiteral("●") : QStringLiteral("○")),
-                                       p.handle,
-                                       p.displayName,
-                                       p.modelId,
-                                       stateStr,
-                                       sizeTag);
+        // Status pill: speaking > disabled > provider / residency
+        QString pillText;
+        QString pillColor;
+        if (isSpeaking) {
+            pillText = "speaking";
+            pillColor = "#38bdf8";
+        } else if (!p.enabled) {
+            pillText = "disabled";
+            pillColor = "#64748b";
+        } else if (external) {
+            const bool known = m_orchestrator->providerFor(p) != nullptr;
+            pillText = known ? ("☁ " + providerName(p.providerId)) : QStringLiteral("☁ provider missing");
+            pillColor = known ? "#a78bfa" : "#f87171";
+        } else if (mi.status == "loaded" || mi.status == "loading") {
+            pillText = mi.status;
+            pillColor = "#4ade80";
+        } else if (mi.status == "sleeping") {
+            pillText = "sleeping";
+            pillColor = "#fbbf24";
+        } else {
+            pillText = mi.status.isEmpty() ? QStringLiteral("unloaded") : mi.status;
+            pillColor = "#64748b";
+        }
 
-        auto* item = new QListWidgetItem(label, m_listParticipants);
-        item->setForeground(QColor(p.colorHex));
+        auto* card = new QWidget();
+        card->setObjectName("participantCard");
+        auto* grid = new QVBoxLayout(card);
+        grid->setContentsMargins(8, 6, 8, 6);
+        grid->setSpacing(2);
+
+        auto* top = new QHBoxLayout();
+        top->setSpacing(6);
+        auto* name = new QLabel(QStringLiteral("<span style='color:%1; font-weight:700;'>%2</span>"
+                                               " <span style='color:#94a3b8;'>%3</span>")
+                                    .arg(p.enabled ? p.colorHex : QStringLiteral("#64748b"),
+                                         p.handle.toHtmlEscaped(), p.displayName.toHtmlEscaped()),
+                                card);
+        name->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        auto* pill = new QLabel(pillText, card);
+        pill->setStyleSheet(QStringLiteral("color:%1; border:1px solid %1; border-radius:9px; "
+                                           "padding:1px 7px; font-size:11px;").arg(pillColor));
+        top->addWidget(name, 1);
+        top->addWidget(pill);
+
+        QString modelLine = p.modelId;
+        if (mi.sizeGiB > 0.01) modelLine += QStringLiteral(" · %1 GiB").arg(QString::number(mi.sizeGiB, 'f', 1));
+        auto* model = new QLabel(modelLine, card);
+        model->setObjectName("participantModel");
+        model->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+
+        grid->addLayout(top);
+        grid->addWidget(model);
+        card->setToolTip(QStringLiteral("%1 (%2)\nModel: %3\nTemperature: %4\n\nDouble-click to edit.")
+                             .arg(p.handle, p.displayName, p.modelId, QString::number(p.temperature, 'f', 2)));
+
+        auto* item = new QListWidgetItem(m_listParticipants);
+        card->ensurePolished();
+        item->setSizeHint(QSize(0, qMax(card->sizeHint().height(), card->minimumSizeHint().height()) + 8));
+        m_listParticipants->setItemWidget(item, card);
+    }
+    if (previousRow >= 0 && previousRow < m_listParticipants->count()) {
+        m_listParticipants->setCurrentRow(previousRow);
     }
 }
 
 void MainWindow::refreshSessionsList() {
     m_listSessions->clear();
+    const QString currentId = m_orchestrator->session().id;
     const auto summaries = m_store->listSessionSummaries();
     for (const auto& s : summaries) {
+        QString when = s.updatedAt;
+        const QDateTime dt = QDateTime::fromString(s.updatedAt, Qt::ISODate);
+        if (dt.isValid()) when = dt.toLocalTime().toString("d MMM, HH:mm");
+        const bool current = (s.id == currentId);
         auto* item = new QListWidgetItem(
-            QStringLiteral("%1 (%2 msgs)").arg(s.title, QString::number(s.messageCount)),
+            QStringLiteral("%1%2\n%3 messages · %4")
+                .arg(current ? QStringLiteral("● ") : QString(), s.title, QString::number(s.messageCount), when),
             m_listSessions);
         item->setData(Qt::UserRole, s.id);
+        item->setData(Qt::UserRole + 1, s.title);
+        if (current) item->setForeground(QColor("#93c5fd"));
     }
 }
 
@@ -816,7 +1292,7 @@ void MainWindow::onSendUserMessage(const QString& text, bool autoStartDebate) {
     }
 
     m_orchestrator->addUserMessage(text);
-    m_store->saveSession(m_orchestrator->session());
+    persistSession();
     refreshSessionsList();
 
     if (autoStartDebate && !m_orchestrator->isRunning()) {
@@ -954,8 +1430,7 @@ void MainWindow::onAddParticipantClicked() {
 
     if (showParticipantDialog(&p, "Add Room Participant")) {
         m_orchestrator->session().participants.append(p);
-        refreshParticipantsList();
-        m_transcriptPane->setMentionParticipants(m_orchestrator->session().participants);
+        onRosterChanged();
     }
 }
 
@@ -967,8 +1442,7 @@ void MainWindow::onEditParticipantClicked() {
     Participant copy = parts[row];
     if (showParticipantDialog(&copy, "Edit Participant")) {
         parts[row] = copy;
-        refreshParticipantsList();
-        m_transcriptPane->setMentionParticipants(parts);
+        onRosterChanged();
     }
 }
 
@@ -976,43 +1450,59 @@ void MainWindow::onRemoveParticipantClicked() {
     const int row = m_listParticipants->currentRow();
     auto& parts = m_orchestrator->session().participants;
     if (row < 0 || row >= parts.size()) return;
+    if (QMessageBox::question(this, "Remove Participant",
+                              QStringLiteral("Remove %1 from the room?").arg(parts[row].handle)) != QMessageBox::Yes) {
+        return;
+    }
     parts.removeAt(row);
-    refreshParticipantsList();
-    m_transcriptPane->setMentionParticipants(parts);
-}
-
-void MainWindow::onResetCouncilPresetClicked() {
-    populateDefaultCouncil();
+    onRosterChanged();
 }
 
 void MainWindow::onNewSessionClicked() {
     m_orchestrator->stopDebate();
-    const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-    const QString newWs = dataDir + "/workspaces/session_" +
-                          QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+    persistSession();
+    const QString newWs = newWorkspacePath();
     QDir().mkpath(newWs);
 
     RoomSession s;
     s.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     s.title = "New Agora Debate";
     s.workspacePath = newWs;
+    s.mode = m_orchestrator->session().mode;
     s.vramBudgetGiB = m_spinVramBudget->value();
     s.maxRounds = m_spinMaxRounds->value();
     s.participants = m_orchestrator->session().participants;
+    openSession(s);
+}
 
+void MainWindow::openSession(const RoomSession& session) {
+    m_workspacePane->clearSelectedFile();
     if (!m_fsWatcher->directories().isEmpty()) {
         m_fsWatcher->removePaths(m_fsWatcher->directories());
     }
-    m_sandbox->setWorkspacePath(newWs);
+    if (!m_fsWatcher->files().isEmpty()) {
+        m_fsWatcher->removePaths(m_fsWatcher->files());
+    }
+
+    m_sandbox->setWorkspacePath(session.workspacePath);
+    m_sandbox->setAllowNetwork(session.allowSandboxNetwork);
     m_sandbox->ensureWorkspaceInitialized();
-    m_fsWatcher->addPath(newWs);
+    if (!session.workspacePath.isEmpty()) {
+        m_fsWatcher->addPath(session.workspacePath);
+    }
 
-    m_workspacePane->clearSelectedFile();
-    m_workspacePane->setWorkspacePath(newWs);
-    m_orchestrator->setSession(s);
+    m_orchestrator->setSession(session);
+    m_workspacePane->setWorkspacePath(session.workspacePath);
+    syncRoomControls();
 
+    refreshParticipantsList();
+    m_transcriptPane->setMentionParticipants(session.participants);
     m_workspacePane->refreshViews();
-    m_transcriptPane->setMessages(m_orchestrator->session().messages);
+    m_transcriptPane->setMessages(session.messages);
+    refreshSessionsList();
+    if (!session.messages.isEmpty()) {
+        QSettings().setValue("room/lastSessionId", session.id);
+    }
 }
 
 void MainWindow::onSaveSessionClicked() {
@@ -1021,6 +1511,7 @@ void MainWindow::onSaveSessionClicked() {
         QMessageBox::warning(this, "Save Failed", err);
         return;
     }
+    QSettings().setValue("room/lastSessionId", m_orchestrator->session().id);
     refreshSessionsList();
     statusBar()->showMessage("Session saved to SQLite.", 4000);
 }
@@ -1041,37 +1532,14 @@ void MainWindow::onExportMarkdownClicked() {
 void MainWindow::onSessionListDoubleClicked(QListWidgetItem* item) {
     if (!item) return;
     const QString id = item->data(Qt::UserRole).toString();
-    if (id.isEmpty()) return;
+    if (id.isEmpty() || id == m_orchestrator->session().id) return;
 
     QTimer::singleShot(0, this, [this, id]() {
         auto loaded = m_store->loadSession(id);
         if (!loaded) return;
-
-        m_workspacePane->clearSelectedFile();
-
-        if (!m_fsWatcher->directories().isEmpty()) {
-            m_fsWatcher->removePaths(m_fsWatcher->directories());
-        }
-        if (!m_fsWatcher->files().isEmpty()) {
-            m_fsWatcher->removePaths(m_fsWatcher->files());
-        }
-
-        m_sandbox->setWorkspacePath(loaded->workspacePath);
-        m_sandbox->ensureWorkspaceInitialized();
-        if (!loaded->workspacePath.isEmpty()) {
-            m_fsWatcher->addPath(loaded->workspacePath);
-        }
-
-        m_orchestrator->setSession(*loaded);
-        m_workspacePane->setWorkspacePath(loaded->workspacePath);
-        m_workspacePane->setAllowNetwork(loaded->allowSandboxNetwork);
-        m_spinMaxRounds->setValue(loaded->maxRounds);
-        m_spinVramBudget->setValue(loaded->vramBudgetGiB);
-
-        refreshParticipantsList();
-        m_transcriptPane->setMentionParticipants(loaded->participants);
-        m_workspacePane->refreshViews();
-        m_transcriptPane->setMessages(loaded->messages);
+        m_orchestrator->stopDebate();
+        persistSession();
+        openSession(*loaded);
         statusBar()->showMessage("Loaded room: " + loaded->title, 4000);
     });
 }

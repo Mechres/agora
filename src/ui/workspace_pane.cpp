@@ -71,12 +71,16 @@ WorkspacePane::WorkspacePane(BwrapSandbox* sandbox, ToolEngine* toolEngine, QWid
     rightLayout->setContentsMargins(4, 4, 4, 4);
 
     auto* wsHeaderRow = new QHBoxLayout();
-    wsHeaderRow->addWidget(new QLabel("<b>Sandbox:</b>", this));
+    auto* lblWorkspace = new QLabel("WORKSPACE", this);
+    lblWorkspace->setProperty("role", "section");
+    wsHeaderRow->addWidget(lblWorkspace);
     m_editWorkspacePath = new QLineEdit(m_sandbox->workspacePath(), this);
     m_editWorkspacePath->setReadOnly(true);
-    auto* btnBrowseWs = new QPushButton("Folder...", this);
-    m_chkAllowNetwork = new QCheckBox("Net (--share-net)", this);
-    m_chkAllowNetwork->setToolTip("When unchecked, Bubblewrap runs with --unshare-all (complete network isolation)");
+    auto* btnBrowseWs = new QPushButton("Change…", this);
+    btnBrowseWs->setToolTip("Use another folder as the sandbox workspace");
+    m_chkAllowNetwork = new QCheckBox("Network", this);
+    m_chkAllowNetwork->setToolTip("Allow sandboxed commands to use the network (bwrap --share-net). "
+                                  "Off = complete network isolation.");
     wsHeaderRow->addWidget(m_editWorkspacePath, 1);
     wsHeaderRow->addWidget(btnBrowseWs);
     wsHeaderRow->addWidget(m_chkAllowNetwork);
@@ -95,7 +99,7 @@ WorkspacePane::WorkspacePane(BwrapSandbox* sandbox, ToolEngine* toolEngine, QWid
 
     auto* editorHeader = new QHBoxLayout();
     m_lblEditorFile = new QLabel("Select a file from the workspace above", editorContainer);
-    auto* btnSaveFile = new QPushButton("Save Edits", editorContainer);
+    auto* btnSaveFile = new QPushButton("Save", editorContainer);
     editorHeader->addWidget(m_lblEditorFile, 1);
     editorHeader->addWidget(btnSaveFile);
 
@@ -141,9 +145,9 @@ WorkspacePane::WorkspacePane(BwrapSandbox* sandbox, ToolEngine* toolEngine, QWid
     tabTermLayout->addWidget(m_terminalOutput, 1);
     tabTermLayout->addLayout(manualCmdRow);
 
-    m_tabs->addTab(tabFiles, "Files & Code");
+    m_tabs->addTab(tabFiles, "Files && Code");
     m_tabs->addTab(tabDiff, "Git Diff");
-    m_tabs->addTab(tabTerm, "bwrap Terminal");
+    m_tabs->addTab(tabTerm, "Terminal");
 
     rightLayout->addLayout(wsHeaderRow);
     rightLayout->addWidget(m_tabs, 1);

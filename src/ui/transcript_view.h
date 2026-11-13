@@ -38,6 +38,7 @@ signals:
 
 private:
     static QString formatMessageHtml(const ChatMessage& msg, int index, bool isLatestTurn);
+    static QString emptyStateHtml();
     void scheduleFlush();
     void flushHtmlToBrowser();
 

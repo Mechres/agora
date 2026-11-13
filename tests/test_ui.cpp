@@ -10,6 +10,7 @@ private slots:
     void testMarkdownRendering();
     void testMarkdownBlocksRawHtml();
     void testStatsFormatting();
+    void testRolePresetsAndCouncils();
 };
 
 void AgoraUiTest::testMarkdownRendering() {
@@ -50,6 +51,24 @@ void AgoraUiTest::testStatsFormatting() {
     QVERIFY(text.contains("28.4 tok/s"));
     QVERIFY(text.contains("model prep 3.1s"));
     QVERIFY(TranscriptView::formatStats({}).isEmpty());
+}
+
+void AgoraUiTest::testRolePresetsAndCouncils() {
+    const auto presets = defaultRolePresets();
+    QVERIFY(presets.size() >= 14);
+    QSet<QString> handles;
+    for (const auto& r : presets) {
+        QVERIFY2(r.handle.startsWith('@'), qPrintable(r.handle));
+        QVERIFY2(!handles.contains(r.handle), qPrintable("duplicate " + r.handle));
+        QVERIFY(!r.systemPrompt.isEmpty());
+        handles.insert(r.handle);
+    }
+    for (const auto& council : defaultCouncilTemplates()) {
+        QVERIFY(!council.handles.isEmpty());
+        for (const auto& h : council.handles) {
+            QVERIFY2(handles.contains(h), qPrintable(council.name + " uses unknown role " + h));
+        }
+    }
 }
 
 QTEST_MAIN(AgoraUiTest)

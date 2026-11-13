@@ -10,6 +10,7 @@
 #include "ui/transcript_view.h"
 #include "ui/workspace_pane.h"
 
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QDialog>
 #include <QHash>
@@ -31,6 +32,9 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override = default;
 
+protected:
+    void closeEvent(QCloseEvent* event) override;
+
 private slots:
     void onRefreshModels();
     void onStartRouterClicked();
@@ -44,7 +48,6 @@ private slots:
     void onAddParticipantClicked();
     void onEditParticipantClicked();
     void onRemoveParticipantClicked();
-    void onResetCouncilPresetClicked();
 
     void onNewSessionClicked();
     void onSaveSessionClicked();
@@ -59,6 +62,17 @@ private:
     void loadAppSettings();
     void saveAppSettings();
     void populateDefaultCouncil();
+    // Builds the template's roles; participants already in the room with the same handle are kept as-is
+    void loadCouncil(const CouncilTemplate& council);
+    // Call after any change to the roster: refreshes the UI and persists it
+    void onRosterChanged();
+    void saveRoster() const;
+    QVector<Participant> loadSavedRoster() const;
+    // Saves the current room (if it has messages) and remembers it for the next start
+    void persistSession();
+    void openSession(const RoomSession& session);
+    void syncRoomControls();
+    QString newWorkspacePath() const;
     void refreshParticipantsList();
     void refreshSessionsList();
     bool showParticipantDialog(Participant* inOutParticipant, const QString& dialogTitle);

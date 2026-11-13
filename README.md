@@ -9,7 +9,9 @@ Built with zero external C++ dependencies beyond the C++20 standard library and 
 ## Features
 
 - **Multi-Model Debate & Collaboration Room**:
-  - Add multiple local models to the same room with distinct handles (`@architect`, `@coder`, `@reviewer`, `@moderator`) and system prompts.
+  - Add multiple models to the same room with distinct handles and system prompts. 14 role presets: `@architect`, `@coder`, `@reviewer`, `@moderator`, `@tester`, `@security`, `@debugger`, `@perf`, `@devops`, `@docs`, `@product`, `@ux`, `@skeptic`, `@researcher`.
+  - **Councils**: load a ready-made team in one click: Coding Council, Full Dev Team, Debug Squad, Security Review, Performance Pass, Design Debate, Product & Docs. Participants already in the room with the same handle keep their model and prompt.
+  - The roster and the open room are saved automatically and restored on the next start.
   - **Dynamic Speaker Scheduling**: A participant passes the floor by ending its message with another participant's `@handle` (e.g. `-> @coder`); otherwise turns go Round-Robin.
   - **Perspective-Aware Context Formatting**: Each participant sees its own prior turns as `assistant` and peer models' turns (plus tool executions) as structured `user` messages prefixed with `[Speaker: @handle (Model)]`. Consecutive peer messages are merged so strict chat templates accept them.
   - **Context Budget**: History is trimmed to fit each model's context window (`n_ctx` from `/props`), calibrated from the real prompt token counts the server reports. The user's task is always kept; on a context-overflow error the turn is retried once with less history.
@@ -45,7 +47,7 @@ Built with zero external C++ dependencies beyond the C++20 standard library and 
     - `git_diff()`
   - File tools refuse symlinks, `..` traversal and direct `.git` access.
 - **3-Pane Native Qt6 Interface**:
-  - **Left Pane**: Room roster with live model status badges (`loaded`, `sleeping`, `unloaded`), role presets, and SQLite session browser.
+  - **Left Pane**: Participant cards with live status (`loaded`, `sleeping`, `unloaded`, `speaking`, provider), council templates, and the saved-sessions browser (right-click to delete).
   - **Center Pane**: Streaming transcript with Markdown rendering, reasoning (`<think>`) blocks, tool call cards, per-turn stats, checkpoint links, and `@mention` quick-chips.
   - **Right Pane**: Live file browser, syntax-highlighted code editor, colorized `git diff` viewer, and interactive `bwrap` sandbox terminal.
 - **Fully asynchronous core**: model swaps, streams, tool calls and approvals all continue from callbacks, so the UI never blocks and Stop takes effect immediately.
