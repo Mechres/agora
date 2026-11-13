@@ -1,4 +1,5 @@
 # Agora
+<img width="1912" height="1000" alt="image" src="https://github.com/user-attachments/assets/3942524d-6b55-42b1-98b0-d5580e81b2bc" />
 
 **Agora** is a native **C++20 / Qt6** desktop studio where multiple local LLMs debate in a shared room, hand off tasks via `@mentions`, and collaboratively write, patch, review, and execute code inside an isolated **Bubblewrap (`bwrap`)** sandbox workspace.
 
